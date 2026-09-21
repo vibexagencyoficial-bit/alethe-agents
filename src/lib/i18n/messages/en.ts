@@ -218,6 +218,18 @@ export const en = {
   'remote.hiddenAddressPlaceholder':
     'http://192.168.x.x:9340 · Open a pairing window to reveal the address',
   'brand.remote': 'Alethe Remote',
+  'controlPairing.title': 'Pairing request',
+  'controlPairing.description':
+    'A client asked to control Alethe. Read the code here, compare it with the app that is asking, then allow or deny.',
+  'controlPairing.clientLabel': 'Client',
+  'controlPairing.codeLabel': 'Pairing code',
+  'controlPairing.countdown': 'Expires in {seconds}s',
+  'controlPairing.warning':
+    'Only allow if you started this pairing yourself. The code is shown only in this window, so never forward it.',
+  'controlPairing.allow': 'Allow',
+  'controlPairing.deny': 'Deny',
+  'controlPairing.approved': 'Allowed. Waiting for the client to finish pairing.',
+  'controlPairing.denied': 'Denied.',
   'common.details': 'Technical details',
   'common.reload': 'Try again',
   'common.terminal': 'Terminal',

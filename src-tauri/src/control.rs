@@ -14,12 +14,14 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tiny_http::{Header, Request, Response, StatusCode};
 
 const PREFIX: &str = "/control/v1";
 const MAX_BODY: usize = 64 * 1024;
 const PAIRING_WINDOW: Duration = Duration::from_secs(120);
+/// Tauri event the window listens on to open the consent prompt.
+pub const PAIRING_REQUESTED_EVENT: &str = "control://pairing/requested";
 const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CREDENTIAL_SERVICE: &str = "com.kc1t.alethe.control-plane";
 const LEGACY_CREDENTIAL_USER: &str = "sessions";
@@ -180,11 +182,30 @@ struct StoredSession {
     expires_at: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairingStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+impl PairingStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            PairingStatus::Pending => "pending",
+            PairingStatus::Approved => "approved",
+            PairingStatus::Denied => "denied",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PairingChallenge {
     client_id: String,
     code: String,
     expires_at: SystemTime,
+    requested_at: SystemTime,
+    status: PairingStatus,
 }
 
 struct ControlState {
@@ -292,24 +313,83 @@ impl ControlState {
     fn start_pairing(&self, client_id: String) -> Result<Value, String> {
         let client_id = valid_client_id(&client_id)?;
         self.storage_ready()?;
-        let expires_at = SystemTime::now() + PAIRING_WINDOW;
+        let now = SystemTime::now();
+        let expires_at = now + PAIRING_WINDOW;
         let challenge = PairingChallenge {
             client_id: client_id.clone(),
             code: nanoid::nanoid!(32),
             expires_at,
+            requested_at: now,
+            status: PairingStatus::Pending,
         };
-        let pairing_code = challenge.code.clone();
         self.pairing
             .lock()
             .map_err(|_| "pairing_lock_failed".to_string())?
             .replace(challenge);
         Ok(json!({
             "client_id": client_id,
-            "pairing_code": pairing_code,
+            "approval_required": true,
             "expires_at": unix_seconds(expires_at),
             "expires_in_seconds": PAIRING_WINDOW.as_secs(),
             "one_time": true
         }))
+    }
+
+    /// The pairing code only ever leaves through this call, which the Alethe window reaches over
+    /// Tauri IPC. It is deliberately absent from every HTTP response: a client that could read its
+    /// own code would be approving itself.
+    fn pairing_pending(&self) -> Result<Value, String> {
+        let mut pairing = self
+            .pairing
+            .lock()
+            .map_err(|_| "pairing_lock_failed".to_string())?;
+        let Some(challenge) = pairing.as_ref() else {
+            return Ok(json!({ "pending": false }));
+        };
+        if challenge.expires_at <= SystemTime::now() {
+            pairing.take();
+            return Ok(json!({ "pending": false, "expired": true }));
+        }
+        Ok(json!({
+            "pending": true,
+            "client_id": challenge.client_id,
+            "code": challenge.code,
+            "status": challenge.status.as_str(),
+            "requested_at": unix_seconds(challenge.requested_at),
+            "expires_at": unix_seconds(challenge.expires_at),
+            "expires_in_seconds": challenge
+                .expires_at
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                .as_secs()
+        }))
+    }
+
+    fn pairing_decide(&self, approve: bool) -> Result<Value, String> {
+        let mut pairing = self
+            .pairing
+            .lock()
+            .map_err(|_| "pairing_lock_failed".to_string())?;
+        let challenge = pairing
+            .as_mut()
+            .ok_or_else(|| "pairing_not_started".to_string())?;
+        if challenge.expires_at <= SystemTime::now() {
+            pairing.take();
+            return Err("pairing_expired".to_string());
+        }
+        challenge.status = if approve {
+            PairingStatus::Approved
+        } else {
+            PairingStatus::Denied
+        };
+        let client_id = challenge.client_id.clone();
+        let status = challenge.status.as_str();
+        drop(pairing);
+        publish_event(
+            "pairing.decided",
+            &json!({ "client_id": client_id, "approved": approve, "status": status }),
+        );
+        Ok(json!({ "client_id": client_id, "status": status, "approved": approve }))
     }
 
     fn complete_pairing(&self, input: PairingCompleteInput) -> Result<Value, String> {
@@ -327,6 +407,12 @@ impl ControlState {
         if challenge.expires_at <= SystemTime::now() {
             let _ = self.pairing.lock().map(|mut pairing| pairing.take());
             return Err("pairing_expired".to_string());
+        }
+        if challenge.status == PairingStatus::Denied {
+            return Err("pairing_denied".to_string());
+        }
+        if challenge.status != PairingStatus::Approved {
+            return Err("pairing_approval_pending".to_string());
         }
         if challenge.client_id != client_id
             || !constant_time_equal(&challenge.code, input.pairing_code.trim())
@@ -1138,23 +1224,17 @@ pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16
         ("GET", "/control/v1/health") => { let _ = request.respond(json_response(200, health(port))); return true; }
         ("GET", "/control/v1/version") => { let _ = request.respond(json_response(200, version())); return true; }
         ("GET", "/control/v1/capabilities") => { let _ = request.respond(json_response(200, capabilities())); return true; }
-        ("POST", "/control/v1/pairing/start") => {
-            let response = match read_json::<PairingStartInput>(&mut request).and_then(|input| state().start_pairing(input.client_id)) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => error_response(400, &error),
-            };
-            let _ = request.respond(response);
-            return true;
-        }
-        ("POST", "/control/v1/pairing/complete") => {
-            let response = match read_json::<PairingCompleteInput>(&mut request).and_then(|input| state().complete_pairing(input)) {
-                Ok(payload) => json_response(200, payload),
-                Err(error) => error_response(if error.starts_with("credential_") { 503 } else { 400 }, &error),
-            };
-            let _ = request.respond(response);
-            return true;
-        }
         _ => {}
+    }
+
+    if let Some(response) = pairing_route(&method, path, &mut request) {
+        // A minimised window has its timers throttled, so the prompt is pushed instead of polled:
+        // the event carries no code, and the window reads that over IPC.
+        if path == "/control/v1/pairing/start" && response.status_code().0 == 200 {
+            let _ = app.emit(PAIRING_REQUESTED_EVENT, json!({ "source": "control-plane" }));
+        }
+        let _ = request.respond(response);
+        return true;
     }
 
     let Some(token) = bearer_token(&request) else { let _ = request.respond(unauthorized_response()); return true; };
@@ -1272,6 +1352,51 @@ fn terminal_route(app: &AppHandle, method: &str, path: &str, url: &str, request:
     }
 }
 
+/// Public pairing routes, split out of `handle_request` so the flow can be driven over a real
+/// socket without an `AppHandle`.
+fn pairing_route(
+    method: &str,
+    path: &str,
+    request: &mut Request,
+) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    match (method, path) {
+        ("POST", "/control/v1/pairing/start") => Some(
+            match read_json::<PairingStartInput>(request)
+                .and_then(|input| state().start_pairing(input.client_id))
+            {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => error_response(400, &error),
+            },
+        ),
+        ("POST", "/control/v1/pairing/complete") => Some(
+            match read_json::<PairingCompleteInput>(request)
+                .and_then(|input| state().complete_pairing(input))
+            {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => error_response(
+                    if error.starts_with("credential_") { 503 } else { 400 },
+                    &error,
+                ),
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// The Alethe window reads the pending pairing request through here. Tauri IPC is the only channel
+/// that reaches this, which is what keeps the code away from the HTTP client asking to pair.
+#[tauri::command]
+pub fn control_pairing_pending() -> Result<Value, String> {
+    state().pairing_pending()
+}
+
+/// The human decision behind [Permitir]/[Recusar]: approving here is what lets `complete_pairing`
+/// mint a token.
+#[tauri::command]
+pub fn control_pairing_decide(approve: bool) -> Result<Value, String> {
+    state().pairing_decide(approve)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,5 +1444,154 @@ mod tests {
         assert!(frame.starts_with("event: agent-hook\ndata: "));
         assert!(frame.ends_with("\n\n"));
         assert!(frame.contains("\"agent\":\"codex\""));
+    }
+
+    use std::io::Read;
+
+    fn http_request(port: u16, path: &str, body: Option<&str>) -> (u16, String) {
+        let body_text = body.unwrap_or("");
+        let raw_request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
+            body_text.len()
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to control server");
+        stream.write_all(raw_request.as_bytes()).expect("write request");
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).expect("read response");
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status code");
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.trim().to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    fn pairing_body(client_id: &str, code: &str) -> String {
+        json!({ "client_id": client_id, "pairing_code": code }).to_string()
+    }
+
+    fn window_code() -> String {
+        state().pairing_pending().expect("pending payload")["code"]
+            .as_str()
+            .expect("code visible to the window")
+            .to_string()
+    }
+
+    fn expire_window() {
+        let mut pairing = state().pairing.lock().expect("lock");
+        let challenge = pairing.as_mut().expect("challenge");
+        challenge.expires_at = SystemTime::now() - Duration::from_secs(1);
+    }
+
+    #[test]
+    fn pairing_needs_a_window_approval_and_the_code_is_one_time() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
+        let port = server.server_addr().to_ip().expect("ip listener").port();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let method = request.method().to_string();
+                let url = request.url().to_string();
+                let path = endpoint_path(&url).to_string();
+                let response = pairing_route(&method, &path, &mut request)
+                    .unwrap_or_else(|| error_response(404, "control_route_not_found"));
+                let _ = request.respond(response);
+            }
+        });
+
+        let start = json!({ "client_id": "transcripts" }).to_string();
+
+        // 1. the asking client is told approval is required and never receives the code
+        let (status, body) = http_request(port, "/control/v1/pairing/start", Some(&start));
+        assert_eq!(status, 200);
+        let payload: Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(payload["approval_required"], true);
+        assert_eq!(payload["client_id"], "transcripts");
+        assert!(payload.get("pairing_code").is_none(), "start leaked the pairing code over HTTP");
+
+        // 2. the code exists only on the window side
+        let pending = state().pairing_pending().expect("pending payload");
+        assert_eq!(pending["pending"], true);
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(window_code().len(), 32);
+
+        // 3. completing before the human approves is refused
+        let pending_body = pairing_body("transcripts", &window_code());
+        let (status, body) = http_request(port, "/control/v1/pairing/complete", Some(&pending_body));
+        assert_eq!(status, 400);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["error"],
+            "pairing_approval_pending"
+        );
+
+        // 4. a denied request can never mint a token, even with the right code
+        state().pairing_decide(false).expect("deny");
+        let (status, body) = http_request(port, "/control/v1/pairing/complete", Some(&pending_body));
+        assert_eq!(status, 400);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["error"],
+            "pairing_denied"
+        );
+
+        // 5. an approved request pairs exactly once
+        let (status, _) = http_request(port, "/control/v1/pairing/start", Some(&start));
+        assert_eq!(status, 200);
+        let approved_code = window_code();
+        let approved_body = pairing_body("transcripts", &approved_code);
+        state().pairing_decide(true).expect("approve");
+        let (status, body) = http_request(port, "/control/v1/pairing/complete", Some(&approved_body));
+        assert_eq!(status, 200);
+        let payload: Value = serde_json::from_str(&body).expect("json body");
+        let token = payload["access_token"].as_str().expect("access token").to_string();
+        assert_eq!(payload["token_type"], "Bearer");
+        assert!(state().authenticate(&token).is_ok(), "minted token must authenticate");
+
+        // 6. the same code cannot be replayed
+        let (status, body) = http_request(port, "/control/v1/pairing/complete", Some(&approved_body));
+        assert_eq!(status, 400);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["error"],
+            "pairing_not_started"
+        );
+
+        // 7. an expired request is refused to the client, even with the right code
+        let (status, _) = http_request(port, "/control/v1/pairing/start", Some(&start));
+        assert_eq!(status, 200);
+        let expired_code = window_code();
+        expire_window();
+        let (status, body) = http_request(
+            port,
+            "/control/v1/pairing/complete",
+            Some(&pairing_body("transcripts", &expired_code)),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["error"],
+            "pairing_expired"
+        );
+        // the refused completion already dropped it, so nothing is left to approve
+        assert_eq!(
+            state().pairing_pending().expect("pending payload")["pending"],
+            false
+        );
+
+        // 8. the window side cannot approve an expired request either
+        let (status, _) = http_request(port, "/control/v1/pairing/start", Some(&start));
+        assert_eq!(status, 200);
+        expire_window();
+        assert_eq!(
+            state().pairing_decide(true).expect_err("expired request cannot be approved"),
+            "pairing_expired"
+        );
+        assert_eq!(
+            state().pairing_pending().expect("pending payload")["pending"],
+            false
+        );
+
+        // the test session lives in the real credential store; take it back out
+        state().revoke(&token).expect("revoke test session");
     }
 }

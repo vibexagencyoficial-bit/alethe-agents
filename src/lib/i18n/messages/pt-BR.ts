@@ -217,6 +217,18 @@ export const ptBR: Record<MessageKey, string> = {
   'remote.hiddenAddressPlaceholder':
     'http://192.168.x.x:9340 · Abra uma janela de pareamento para revelar o endereço',
   'brand.remote': 'Alethe Remote',
+  'controlPairing.title': 'Pedido de pareamento',
+  'controlPairing.description':
+    'Um cliente pediu para controlar o Alethe. Leia o código aqui, confira com o app que está pedindo e então permita ou recuse.',
+  'controlPairing.clientLabel': 'Cliente',
+  'controlPairing.codeLabel': 'Código de pareamento',
+  'controlPairing.countdown': 'Expira em {seconds}s',
+  'controlPairing.warning':
+    'Só permita se você mesmo iniciou este pareamento. O código aparece apenas nesta janela, então nunca repasse.',
+  'controlPairing.allow': 'Permitir',
+  'controlPairing.deny': 'Recusar',
+  'controlPairing.approved': 'Permitido. Aguardando o cliente concluir o pareamento.',
+  'controlPairing.denied': 'Recusado.',
   'common.details': 'Detalhes técnicos',
   'common.reload': 'Tentar novamente',
   'common.terminal': 'Terminal',

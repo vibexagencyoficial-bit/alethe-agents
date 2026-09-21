@@ -372,6 +372,8 @@ pub fn run() {
             git_control::git_revert_commit,
             git_control::git_reset_to_commit,
             git_control::git_incoming_outgoing,
+            control::control_pairing_pending,
+            control::control_pairing_decide,
             diagnostics::open_data_folder,
             diagnostics::open_spawn_log,
             diagnostics::open_in_file_explorer,

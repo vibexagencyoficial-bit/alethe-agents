@@ -7,6 +7,7 @@ import { Group as PanelGroup, Panel, Separator, usePanelRef } from 'react-resiza
 import styles from './App.module.css'
 import homeBackground from './assets/home-bg-right.png'
 import { AgentSandbox } from './components/AgentSandbox'
+import { ControlPairingConsent } from './components/ControlPairing/ControlPairingConsent'
 import { DictationButton } from './components/DictationButton'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { FocusOverlay } from './components/FocusOverlay'
@@ -18,10 +19,10 @@ import { AddBrowserModal } from './components/modals/AddBrowserModal'
 import { AddContentModal } from './components/modals/AddContentModal'
 import { AiUsageModal } from './components/modals/AiUsageModal'
 import { AuditModal } from './components/modals/AuditModal'
-import { FsBrowserModal } from './components/modals/FsBrowserModal'
 import { EditGroupModal } from './components/modals/EditGroupModal'
 import { EditProjectModal } from './components/modals/EditProjectModal'
 import { FindJumpModal } from './components/modals/FindJumpModal'
+import { FsBrowserModal } from './components/modals/FsBrowserModal'
 import { HandoffModal } from './components/modals/HandoffModal'
 import { McpIntroModal } from './components/modals/McpIntroModal'
 import { McpManagerModal } from './components/modals/McpManagerModal'
@@ -736,6 +737,7 @@ export default function App() {
         <FsBrowserModal />
       </ErrorBoundary>
       <InAppNotifications />
+      <ControlPairingConsent />
       {activeView === 'agentCanvas' ? <TokenHud /> : null}
     </>
   )
