@@ -247,9 +247,37 @@ fn subscribe_events() -> Receiver<String> {
     receiver
 }
 
+/// Tipos de evento que podem sair pelo `/control/v1/events`. O bus é compartilhado com a interface
+/// (scheduler, supervisor, planejamento, merge, gráficos) e vários desses eventos levam texto do
+/// usuário no payload — `task_title` no `AgentSpawnRequested`, `subject` no `PlanningCommitted`,
+/// `error`/`reason` nos `TaskFailed`. O stream é a fronteira do control plane e o consumidor
+/// persiste o que recebe, então o que não está nesta lista não atravessa: um evento novo no bus não
+/// vaza por descuido, só entra aqui por decisão. Os eventos desta lista ainda passam pelo guarda de
+/// conteúdo do `emit_control_event`.
+const SSE_PUBLISHED_EVENTS: &[&str] = &[
+    "agent.started",
+    "agent.working",
+    "agent.completed",
+    "agent.failed",
+    "agent.stopped",
+    "terminal.output",
+    "file.changed",
+    "git.changed",
+    "worktree.created",
+    "worktree.removed",
+    "validation.started",
+    "validation.completed",
+    // já saíam pelo stream antes desta task: o anúncio do pareamento (Task 1) e o `agent.started`
+    "pairing.decided",
+    // diagnóstico da ponte: sem isso o consumidor não sabe que perdeu evento nem que a ponte caiu
+    "bus.lagged",
+    "bus.bridge_unavailable",
+];
+
 /// Ponte event bus → SSE. O bus é a fonte única do ciclo de vida (scheduler, supervisor, rotas do
 /// control plane, pty) e o `/control/v1/events` é o consumidor externo; sem a ponte o stream nasce
-/// quase vazio, que era o defeito desta task. Idempotente: a primeira assinatura liga.
+/// quase vazio, que era o defeito desta task. Idempotente: a primeira assinatura liga. Só o que
+/// está em `SSE_PUBLISHED_EVENTS` atravessa — o resto do bus morre aqui.
 fn ensure_bus_bridge() {
     static BRIDGE: OnceLock<()> = OnceLock::new();
     if BRIDGE.set(()).is_err() {
@@ -263,7 +291,11 @@ fn ensure_bus_bridge() {
         .name("alethe-bus-bridge".to_string())
         .spawn(move || loop {
             match receiver.blocking_recv() {
-                Ok(payload) => publish_event(&payload.event_type, &bus_envelope(&payload)),
+                Ok(payload) => {
+                    if SSE_PUBLISHED_EVENTS.contains(&payload.event_type.as_str()) {
+                        publish_event(&payload.event_type, &bus_envelope(&payload));
+                    }
+                }
                 // Perder eventos por lentidão não pode derrubar a ponte: o consumidor recebe um
                 // aviso com o tamanho do salto e o stream continua vivo.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -2004,6 +2036,23 @@ mod tests {
         buffer
     }
 
+    /// Lê tudo o que chegar dentro de uma janela de tempo e devolve o acumulado. É o que permite
+    /// afirmar ausência: depois do evento positivo o teste deixa o stream quieto e só então procura o
+    /// que não podia sair. O read timeout curto do socket faz a janela terminar sozinha.
+    fn sse_read_window(stream: &mut std::net::TcpStream, window: Duration) -> String {
+        let deadline = std::time::Instant::now() + window;
+        let mut buffer = String::new();
+        let mut chunk = [0u8; 4096];
+        while std::time::Instant::now() < deadline {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => buffer.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(_) => continue,
+            }
+        }
+        buffer
+    }
+
     /// Parea de verdade (start → aprovação na janela → complete) e devolve o token.
     fn pair_for_token(port: u16) -> String {
         let start = json!({ "client_id": "transcripts" }).to_string();
@@ -2619,27 +2668,31 @@ mod tests {
             "SSE precisa ser text/event-stream: {opening}"
         );
 
-        // nomes exclusivos deste teste: o processo inteiro compartilha o mesmo bus, e os testes
-        // rodam em paralelo
-        emit_control_event("sse.bridge.first", None, json!({ "marker": "um" }));
+        // eventos da lista do stream (os mesmos do ciclo de vida real): o processo inteiro
+        // compartilha o mesmo bus e os testes rodam em paralelo, então nada de tipo inventado
+        emit_control_event(
+            "agent.working",
+            Some("agent-1".to_string()),
+            json!({ "agent_id": "agent-1", "source": "send", "message_bytes": 7 }),
+        );
         crate::event_bus::publish_event_simple(
-            "sse.bridge.second",
+            "terminal.output",
             "sched-test",
             None,
             Some("agent-1".to_string()),
-            json!({ "marker": "dois" }),
+            json!({ "bytes": 12, "dropped_bytes": 0 }),
         );
 
         let frames = sse_read_until_all(
             &mut stream,
-            &["event: sse.bridge.first", "event: sse.bridge.second"],
+            &["event: agent.working", "event: terminal.output"],
             deadline,
         );
         let first_at = frames
-            .find("event: sse.bridge.first")
+            .find("event: agent.working")
             .unwrap_or_else(|| panic!("primeiro evento não chegou no SSE: {frames}"));
         let second_at = frames
-            .find("event: sse.bridge.second")
+            .find("event: terminal.output")
             .unwrap_or_else(|| panic!("segundo evento não chegou no SSE: {frames}"));
         assert!(
             first_at < second_at,
@@ -2650,13 +2703,105 @@ mod tests {
             "evento do control plane precisa levar o envelope com correlation_id: {frames}"
         );
         assert!(
-            frames.contains("\"marker\":\"um\"") && frames.contains("\"marker\":\"dois\""),
+            frames.contains("\"message_bytes\":7") && frames.contains("\"bytes\":12"),
             "o data do bus precisa chegar inteiro: {frames}"
         );
         assert!(
             frames.contains("\"agent_id\":\"agent-1\""),
             "o envelope do bus precisa manter agent_id: {frames}"
         );
+
+        state().revoke(&token).expect("revoke test session");
+    }
+
+    /// O outro lado da fronteira do stream: o bus carrega evento interno com texto do usuário
+    /// (`task_title` do scheduler, `subject` do planejamento, `error` dos `TaskFailed`) e nada disso
+    /// pode chegar ao consumidor externo, que persiste o que recebe. O teste prova as duas pontas na
+    /// mesma rodada: o evento interno **entrou no bus** (o assinante do teste o recebe) e **não** saiu
+    /// no stream, enquanto um evento da lista saiu. Sem a primeira metade o teste passaria por
+    /// vacuidade — bastaria a emissão não ter acontecido.
+    #[test]
+    fn internal_bus_events_with_user_text_do_not_cross_the_stream() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
+        let port = server.server_addr().to_ip().expect("ip listener").port();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let method = request.method().to_string();
+                let url = request.url().to_string();
+                let path = endpoint_path(&url).to_string();
+                if let Some(response) = pairing_route(&method, &path, &mut request) {
+                    let _ = request.respond(response);
+                    continue;
+                }
+                let request = match events_route(&method, &path, request) {
+                    Some(restored) => restored,
+                    None => continue,
+                };
+                let _ = request.respond(error_response(404, "control_route_not_found"));
+            }
+        });
+
+        let token = pair_for_token(port);
+        let mut stream = sse_connect(port, &token);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let opening = sse_read_until_all(&mut stream, &["event: ready"], deadline);
+        assert!(
+            opening.starts_with("HTTP/1.1 200"),
+            "SSE precisa abrir com 200: {opening}"
+        );
+
+        // o assinante do teste vê o mesmo bus que a ponte: é ele que prova que o evento sujo existiu
+        let mut bus = crate::event_bus::subscribe();
+        let titulo = "consertar o login do cliente acme";
+        crate::event_bus::publish_event_simple(
+            "AgentSpawnRequested",
+            "sched-test",
+            None,
+            Some("agent-1".to_string()),
+            json!({ "agent_id": "agent-1", "worktree_path": "D:\\wt", "task_title": titulo }),
+        );
+        crate::event_bus::publish_event_simple(
+            "TaskCompleted",
+            "sched-test",
+            None,
+            None,
+            json!({}),
+        );
+        let visto_no_bus = bus.blocking_recv().expect("evento no bus");
+        assert_eq!(
+            visto_no_bus.event_type, "AgentSpawnRequested",
+            "o evento interno precisa ter entrado no bus para o teste valer"
+        );
+        assert_eq!(
+            visto_no_bus.data["task_title"], titulo,
+            "o bus carrega o texto do usuário: é ele que não pode atravessar"
+        );
+
+        emit_control_event(
+            "agent.started",
+            Some("agent-1".to_string()),
+            json!({ "agent_id": "agent-1", "agent": "cmd", "status": "started", "source": "teste" }),
+        );
+        let frames = sse_read_until_all(&mut stream, &["event: agent.started"], deadline);
+        assert!(
+            frames.contains("event: agent.started"),
+            "evento da lista precisa sair no stream: {frames}"
+        );
+
+        // o evento interno foi publicado antes do da lista e a ponte entrega na ordem do bus, então
+        // quando o da lista aparece o interno já teria aparecido — a janela extra é para o caso de o
+        // frame do interno estar a caminho
+        let depois = sse_read_window(&mut stream, Duration::from_millis(700));
+        let tudo = format!("{frames}{depois}");
+        for proibido in ["AgentSpawnRequested", "TaskCompleted", "task_title", titulo] {
+            assert!(
+                !tudo.contains(proibido),
+                "evento interno atravessou o stream ('{proibido}'): {tudo}"
+            );
+        }
 
         state().revoke(&token).expect("revoke test session");
     }
