@@ -409,6 +409,9 @@ fn emit_file_changed(action: &str, path: String, destination: Option<String>) {
 /// (pull/push/commit devolvem stdout ao chamador, mas o evento é persistido pelo consumidor) — e por
 /// isso não vai a lista de caminhos, só quantos foram: um `stage` de mil arquivos não pode inflar o
 /// evento guardado. Quem quiser o detalhe pede `git status`/`git diff`.
+///
+/// `repo` vai como a rota recebeu, exceto no `init`, que canonicaliza (é o root que o git devolve) —
+/// por isso lá o prefixo verbatim do Windows é removido, e não nos outros.
 fn emit_git_changed(action: &str, repo: String, extra: &[(&str, Value)]) {
     let mut payload = json!({ "action": action, "repo": repo });
     for (key, value) in extra {
@@ -1287,7 +1290,12 @@ fn git_route(method: &str, path: &str, url: &str, request: &mut Request) -> Opti
                 });
                 match outcome {
                     Ok(repo_root) => {
-                        emit_git_changed("init", repo_root.clone(), &[]);
+                        // `git_init` devolve o caminho canonicalizado (`\\?\C:\...` no Windows); o
+                        // evento leva a forma sem o prefixo verbatim, que é a que o consumidor
+                        // consegue casar com os caminhos que ele mesmo usa. A resposta da rota
+                        // continua devolvendo o caminho do jeito que sempre devolveu.
+                        let repo = crate::worktrees::git_arg(std::path::Path::new(&repo_root));
+                        emit_git_changed("init", repo, &[]);
                         json_response(201, json!({ "repo_root": repo_root }))
                     }
                     Err(error) => error_response(400, &error),
@@ -1935,8 +1943,10 @@ mod tests {
         stream
     }
 
-    /// Acumula do stream até todos os `needles` aparecerem ou o deadline estourar. Dois frames
-    /// podem chegar no mesmo recv, então a asserção de ordem é feita no buffer acumulado.
+    /// Acumula do stream até todos os `needles` aparecerem — e até o buffer terminar numa fronteira de
+    /// quadro (`\n\n`), senão a última needle pode ser encontrada no meio de um quadro que ainda não
+    /// chegou inteiro e a asserção sobre o payload dela falha sem o app ter errado. Dois frames podem
+    /// chegar no mesmo recv, então a asserção de ordem é feita no buffer acumulado.
     fn sse_read_until_all(
         stream: &mut std::net::TcpStream,
         needles: &[&str],
@@ -1945,7 +1955,8 @@ mod tests {
         let mut buffer = String::new();
         let mut chunk = [0u8; 4096];
         while std::time::Instant::now() < deadline
-            && needles.iter().any(|needle| !buffer.contains(needle))
+            && (needles.iter().any(|needle| !buffer.contains(needle))
+                || !buffer.ends_with("\n\n"))
         {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
@@ -2184,6 +2195,222 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+        state().revoke(&token).expect("revoke test session");
+    }
+
+    /// Frame SSE que contém `needle`, do `event:` até o fim do frame — para afirmar o payload daquele
+    /// evento e não o do seguinte (todos os eventos de git carregam o mesmo repo).
+    fn sse_frame_with(frames: &str, needle: &str) -> String {
+        let at = nth_at(frames, needle, 1);
+        let start = frames[..at].rfind("event: ").unwrap_or(at);
+        let end = frames[at..]
+            .find("\n\n")
+            .map(|offset| at + offset)
+            .unwrap_or(frames.len());
+        frames[start..end].to_string()
+    }
+
+    /// Roda um comando de git de verdade no repo do teste.
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = crate::git_control::checked_output(dir, args)
+            .unwrap_or_else(|error| panic!("git {args:?} falhou: {error}"));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Step 2 da Task 4 no git: cada rota que mexe no repositório conta o que fez no SSE, com o repo —
+    /// e sem o conteúdo (mensagem de commit, saída do git, lista de caminhos). Repo, remote, rotas,
+    /// auth e stream são reais; o remote é um bare local, então push/pull correm de verdade e offline.
+    #[test]
+    fn git_routes_announce_what_changed_without_content() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let port = control_server();
+        let token = pair_for_token(port);
+        let mut stream = sse_connect(port, &token);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let opening = sse_read_until_all(&mut stream, &["event: ready"], deadline);
+        assert!(
+            opening.starts_with("HTTP/1.1 200"),
+            "SSE precisa abrir com 200: {opening}"
+        );
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("alethe-control-git-{suffix}"));
+        let remote = std::env::temp_dir().join(format!("alethe-control-git-remote-{suffix}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(&remote).expect("temp remote dir");
+        git_in(&dir, &["init"]);
+        git_in(&dir, &["config", "user.name", "Alethe Test"]);
+        git_in(&dir, &["config", "user.email", "alethe@example.invalid"]);
+        std::fs::write(dir.join("um.txt"), "um\n").expect("write tracked file");
+        git_in(&dir, &["add", "um.txt"]);
+        git_in(&dir, &["commit", "-m", "inicial"]);
+        let main_branch = git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        // bare local: push/pull reais sem rede
+        let remote_slash = remote.to_string_lossy().replace('\\', "/");
+        git_in(&remote, &["init", "--bare"]);
+        git_in(&dir, &["remote", "add", "origin", &remote_slash]);
+
+        // um commit que só existe no ramo paralelo: é o que o cherry-pick traz e o revert desfaz
+        git_in(&dir, &["checkout", "-b", "alethe/later"]);
+        std::fs::write(dir.join("do-ramo.txt"), "do ramo\n").expect("write branch file");
+        git_in(&dir, &["add", "do-ramo.txt"]);
+        git_in(&dir, &["commit", "-m", "do ramo paralelo"]);
+        let branch_hash = git_in(&dir, &["rev-parse", "HEAD"]);
+        git_in(&dir, &["checkout", &main_branch]);
+        let main_hash = git_in(&dir, &["rev-parse", "HEAD"]);
+
+        let dir_text = dir.to_string_lossy().to_string();
+        let alvo_text = dir.join("alvo.txt").to_string_lossy().to_string();
+        let rascunho_text = dir.join("rascunho.txt").to_string_lossy().to_string();
+        let marker = format!("MENSAGEM-DE-COMMIT-{}", nanoid::nanoid!(8));
+        let git_call = |path: &str, body: Value| {
+            http_call(
+                port,
+                "POST",
+                path,
+                Some(&token),
+                Some(&body.to_string()),
+            )
+        };
+
+        let (status, _) = git_call("/control/v1/git/init", json!({ "path": dir_text }));
+        assert_eq!(status, 201);
+
+        let (status, _) = http_call(
+            port,
+            "PUT",
+            "/control/v1/fs/write",
+            Some(&token),
+            Some(&json!({ "path": alvo_text, "content": "conteudo do alvo\n" }).to_string()),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = git_call(
+            "/control/v1/git/stage",
+            json!({ "repo_root": dir_text, "paths": ["alvo.txt"] }),
+        );
+        assert_eq!(status, 200);
+        let (status, commit_body) = git_call(
+            "/control/v1/git/commit",
+            json!({ "repo_root": dir_text, "message": marker }),
+        );
+        assert_eq!(status, 200);
+        // o git devolve a mensagem no stdout da própria rota: o conteúdo existe e voltou ao chamador,
+        // então a ausência dele no stream não é vacuidade.
+        assert!(
+            commit_body.contains(&marker),
+            "o commit precisa devolver a saída do git ao chamador: {commit_body}"
+        );
+        let (status, _) = git_call(
+            "/control/v1/git/unstage",
+            json!({ "repo_root": dir_text, "paths": ["alvo.txt"] }),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = http_call(
+            port,
+            "PUT",
+            "/control/v1/fs/write",
+            Some(&token),
+            Some(&json!({ "path": rascunho_text, "content": "rascunho\n" }).to_string()),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = git_call(
+            "/control/v1/git/discard",
+            json!({ "repo_root": dir_text, "paths": ["rascunho.txt"], "untracked": true }),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = git_call("/control/v1/git/push", json!({ "path": dir_text }));
+        assert_eq!(status, 200);
+        let (status, _) = git_call("/control/v1/git/pull", json!({ "path": dir_text }));
+        assert_eq!(status, 200);
+        let (status, _) = git_call(
+            "/control/v1/git/branch",
+            json!({ "repo": dir_text, "hash": branch_hash, "branch_name": "alethe/teste" }),
+        );
+        assert_eq!(status, 201);
+        let (status, _) = git_call(
+            "/control/v1/git/cherry-pick",
+            json!({ "repo": dir_text, "hash": branch_hash }),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = git_call(
+            "/control/v1/git/revert",
+            json!({ "repo": dir_text, "hash": branch_hash }),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = git_call(
+            "/control/v1/git/reset",
+            json!({ "repo": dir_text, "hash": main_hash, "mode": "hard" }),
+        );
+        assert_eq!(status, 200);
+
+        let actions = [
+            "init", "stage", "unstage", "discard", "commit", "pull", "push", "branch", "cherry-pick",
+            "revert", "reset",
+        ];
+        let needles: Vec<String> = actions
+            .iter()
+            .map(|action| format!("\"action\":\"{action}\""))
+            .collect();
+        let frames = sse_read_until_all(
+            &mut stream,
+            &needles.iter().map(String::as_str).collect::<Vec<_>>(),
+            deadline,
+        );
+
+        let repo_json = json!(dir_text).to_string();
+        // o init canonicaliza (é o root que o git devolve), os outros ecoam o caminho recebido
+        let canonical_json = json!(crate::worktrees::git_arg(
+            &std::fs::canonicalize(&dir).expect("canonical do repo")
+        ))
+        .to_string();
+        for (action, needle) in actions.iter().zip(needles.iter()) {
+            assert_eq!(
+                frames.matches(needle.as_str()).count(),
+                1,
+                "cada {action} gera exatamente um evento: {frames}"
+            );
+            let frame = sse_frame_with(&frames, needle);
+            assert!(
+                frame.contains("event: git.changed"),
+                "o evento precisa ser git.changed ({action}): {frame}"
+            );
+            let repo = if *action == "init" {
+                &canonical_json
+            } else {
+                &repo_json
+            };
+            assert!(
+                frame.contains(&format!("\"repo\":{repo}")),
+                "o evento precisa dizer em que repo ({action}): {frame}"
+            );
+        }
+        assert!(
+            sse_frame_with(&frames, "\"action\":\"stage\"").contains("\"path_count\":1"),
+            "stage precisa dizer quantos caminhos foram para o índice: {frames}"
+        );
+        assert!(
+            sse_frame_with(&frames, "\"action\":\"reset\"").contains("\"mode\":\"hard\""),
+            "reset precisa dizer o modo: {frames}"
+        );
+
+        assert!(
+            !frames.contains(&marker),
+            "mensagem de commit não pode ir para o stream: {frames}"
+        );
+        for forbidden in ["\"message\"", "\"output\"", "\"paths\""] {
+            assert!(
+                !frames.contains(forbidden),
+                "chave de conteúdo {forbidden} não pode sair no stream: {frames}"
+            );
+        }
+
+        std::fs::remove_dir_all(&remote).expect("cleanup temp remote");
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
         state().revoke(&token).expect("revoke test session");
     }
