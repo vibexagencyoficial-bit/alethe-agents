@@ -283,6 +283,27 @@ fn stream_events(mut writer: Box<dyn Write + Send + 'static>, receiver: Receiver
     }
 }
 
+/// GET /control/v1/events: stream SSE dos eventos de ciclo de vida. `pub(crate)` para o teste
+/// abrir um stream real sem montar um AppHandle. Devolve o request de volta quando a rota não é
+/// esta (`Some(request)`); `None` significa request consumido — pela resposta 401 ou pelo stream.
+pub(crate) fn events_route(method: &str, path: &str, request: Request) -> Option<Request> {
+    if method != "GET" || path != "/control/v1/events" {
+        return Some(request);
+    }
+    let Some(token) = bearer_token(&request) else {
+        let _ = request.respond(unauthorized_response());
+        return None;
+    };
+    if state().authenticate(token).is_err() {
+        let _ = request.respond(unauthorized_response());
+        return None;
+    }
+    let receiver = subscribe_events();
+    let writer = request.into_writer();
+    std::thread::spawn(move || stream_events(writer, receiver));
+    None
+}
+
 impl ControlState {
     fn new() -> Self {
         match load_sessions() {
@@ -1226,14 +1247,10 @@ pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16
     }
     let method = request.method().to_string();
     let path = endpoint_path(url);
-    if method == "GET" && path == "/control/v1/events" {
-        let Some(token) = bearer_token(&request) else { let _ = request.respond(unauthorized_response()); return true; };
-        if state().authenticate(token).is_err() { let _ = request.respond(unauthorized_response()); return true; }
-        let receiver = subscribe_events();
-        let writer = request.into_writer();
-        std::thread::spawn(move || stream_events(writer, receiver));
-        return true;
-    }
+    let mut request = match events_route(&method, path, request) {
+        Some(restored) => restored,
+        None => return true,
+    };
 
     match (method.as_str(), path) {
         ("GET", "/control/v1/health") => { let _ = request.respond(json_response(200, health(port))); return true; }
