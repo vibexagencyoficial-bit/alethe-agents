@@ -351,10 +351,40 @@ pub(crate) fn events_route(method: &str, path: &str, request: Request) -> Option
     None
 }
 
+/// Chaves de conteúdo livre barradas nos eventos do control plane. O consumidor persiste e
+/// retransmite cada evento (outbox do lado Go), então texto de usuário, linha de comando ou saída
+/// de execução viraria conteúdo de terceiro gravado em tabela — token em header, dump de ambiente,
+/// log de teste. A comparação é exata sobre a chave em minúsculas (por isso `message_bytes` passa e
+/// `message` não) e desce em objetos e arrays aninhados.
+const FORBIDDEN_EVENT_KEYS: &[&str] = &[
+    "body", "command", "commands", "content", "data", "input", "message", "output", "password",
+    "prompt", "secret", "stderr", "stdout", "text", "token",
+];
+
+fn forbidden_event_key(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => object.iter().find_map(|(key, nested)| {
+            if FORBIDDEN_EVENT_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
+                Some(key.clone())
+            } else {
+                forbidden_event_key(nested)
+            }
+        }),
+        Value::Array(items) => items.iter().find_map(forbidden_event_key),
+        _ => None,
+    }
+}
+
 /// Fonte única dos eventos de ciclo de vida do control plane: publica no event bus (tokio
 /// broadcast), que alimenta o webview e — pela ponte — o stream SSE. O SSE não recebe evento por
 /// outro caminho, para não existirem duas ordens de entrega para o mesmo ciclo de vida.
 fn emit_control_event(event_type: &str, agent_id: Option<String>, payload: Value) {
+    if let Some(key) = forbidden_event_key(&payload) {
+        // Falha fechada e barulhenta: o evento não sai e o motivo fica no stderr do app. Um emissor
+        // novo que tente mandar conteúdo quebra no teste, não em produção.
+        eprintln!("[event-bus] evento {event_type} recusado: payload carrega conteúdo ('{key}')");
+        return;
+    }
     crate::event_bus::publish_event_simple(
         event_type,
         &format!("ctrl-{}", nanoid::nanoid!(12)),
@@ -1829,6 +1859,64 @@ mod tests {
 
         // the test session lives in the real credential store; take it back out
         state().revoke(&token).expect("revoke test session");
+    }
+
+    /// O evento sai do app e é persistido pelo consumidor: nada de conteúdo livre no payload. Este
+    /// teste é o contrato do guarda — a varredura pega a chave em qualquer profundidade, não confunde
+    /// `message_bytes` com `message`, e a recusa vale de ponta a ponta no bus real (o evento sujo
+    /// não chega em assinante nenhum, o limpo chega).
+    #[test]
+    fn control_events_refuse_content_bearing_keys() {
+        assert_eq!(
+            forbidden_event_key(&json!({ "message": "texto do usuário" })).as_deref(),
+            Some("message")
+        );
+        assert_eq!(
+            forbidden_event_key(&json!({ "resultado": { "output": "dump de execução" } })).as_deref(),
+            Some("output")
+        );
+        assert_eq!(
+            forbidden_event_key(&json!({ "itens": [{ "TEXT": "linha de log" }] })).as_deref(),
+            Some("TEXT")
+        );
+        assert!(forbidden_event_key(
+            &json!({ "action": "stage", "repo": "D:\\repo", "message_bytes": 12 })
+        )
+        .is_none());
+        assert!(forbidden_event_key(
+            &json!({ "agent_id": "a1", "source": "tui", "status": "started" })
+        )
+        .is_none());
+
+        let mut receiver = crate::event_bus::subscribe();
+        let sujo = format!("test.forbidden.{}", nanoid::nanoid!(8));
+        let limpo = format!("test.allowed.{}", nanoid::nanoid!(8));
+        emit_control_event(&sujo, None, json!({ "message": "conteúdo não pode sair" }));
+        emit_control_event(&limpo, None, json!({ "action": "commit", "repo": "D:\\repo" }));
+
+        let mut vistos: Vec<String> = Vec::new();
+        let mut achou_limpo = false;
+        for _ in 0..200 {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    achou_limpo |= event.event_type == limpo;
+                    vistos.push(event.event_type);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    if achou_limpo {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(
+            !vistos.iter().any(|tipo| tipo == &sujo),
+            "evento com conteúdo livre saiu no bus: {vistos:?}"
+        );
+        assert!(achou_limpo, "evento limpo não chegou no bus: {vistos:?}");
     }
 
     /// Gate do Task 3: `capabilities()` é a promessa feita ao consumidor — a rota do `resume` era
