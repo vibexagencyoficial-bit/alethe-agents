@@ -394,6 +394,16 @@ fn emit_control_event(event_type: &str, agent_id: Option<String>, payload: Value
     );
 }
 
+/// O que mudou no disco, não o que foi escrito nele: `action` + `path` (+ `destination` no move). O
+/// evento é persistido pelo consumidor, então conteúdo de arquivo do usuário fica de fora.
+fn emit_file_changed(action: &str, path: String, destination: Option<String>) {
+    let mut payload = json!({ "action": action, "path": path });
+    if let Some(destination) = destination {
+        payload["destination"] = Value::String(destination);
+    }
+    emit_control_event("file.changed", None, payload);
+}
+
 impl ControlState {
     fn new() -> Self {
         match load_sessions() {
@@ -1145,30 +1155,74 @@ fn filesystem_route(method: &str, path: &str, url: &str, request: &mut Request) 
             Ok(content) => json_response(200, json!({ "content": content })),
             Err(error) => error_response(400, &error),
         }),
-        ("PUT", "/control/v1/fs/write") => Some(match read_json::<FilesystemWriteInput>(request).and_then(|input| {
-            let path = std::path::PathBuf::from(input.path.trim());
-            if path.as_os_str().is_empty() {
-                return Err("path_required".to_string());
+        ("PUT", "/control/v1/fs/write") => Some({
+            let outcome = read_json::<FilesystemWriteInput>(request).and_then(|input| {
+                let path = std::path::PathBuf::from(input.path.trim());
+                if path.as_os_str().is_empty() {
+                    return Err("path_required".to_string());
+                }
+                if !path.parent().is_some_and(|parent| parent.is_dir()) {
+                    return Err("parent_directory_not_found".to_string());
+                }
+                std::fs::write(&path, input.content)
+                    .map_err(|error| error.to_string())
+                    .map(|()| path.to_string_lossy().to_string())
+            });
+            match outcome {
+                Ok(path) => {
+                    emit_file_changed("write", path, None);
+                    json_response(200, json!({ "written": true }))
+                }
+                Err(error) => error_response(400, &error),
             }
-            if !path.parent().is_some_and(|parent| parent.is_dir()) {
-                return Err("parent_directory_not_found".to_string());
+        }),
+        ("POST", "/control/v1/fs/mkdir") => Some({
+            let outcome = read_json::<FilesystemPathInput>(request).and_then(|input| {
+                std::fs::create_dir_all(&input.path)
+                    .map_err(|error| error.to_string())
+                    .map(|()| input.path)
+            });
+            match outcome {
+                Ok(path) => {
+                    emit_file_changed("mkdir", path, None);
+                    json_response(201, json!({ "created": true }))
+                }
+                Err(error) => error_response(400, &error),
             }
-            std::fs::write(path, input.content).map_err(|error| error.to_string())
-        }) {
-            Ok(()) => json_response(200, json!({ "written": true })),
-            Err(error) => error_response(400, &error),
         }),
-        ("POST", "/control/v1/fs/mkdir") => Some(match read_json::<FilesystemPathInput>(request).and_then(|input| std::fs::create_dir_all(input.path).map_err(|error| error.to_string())) {
-            Ok(()) => json_response(201, json!({ "created": true })),
-            Err(error) => error_response(400, &error),
+        ("POST", "/control/v1/fs/move") => Some({
+            let outcome = read_json::<FilesystemMoveInput>(request).and_then(|input| {
+                std::fs::rename(&input.path, &input.destination)
+                    .map_err(|error| error.to_string())
+                    .map(|()| (input.path, input.destination))
+            });
+            match outcome {
+                Ok((path, destination)) => {
+                    emit_file_changed("move", path, Some(destination));
+                    json_response(200, json!({ "moved": true }))
+                }
+                Err(error) => error_response(400, &error),
+            }
         }),
-        ("POST", "/control/v1/fs/move") => Some(match read_json::<FilesystemMoveInput>(request).and_then(|input| std::fs::rename(input.path, input.destination).map_err(|error| error.to_string())) {
-            Ok(()) => json_response(200, json!({ "moved": true })),
-            Err(error) => error_response(400, &error),
-        }),
-        ("DELETE", "/control/v1/fs") => Some(match read_json::<FilesystemPathInput>(request).or_else(|_| query_parameter(url, "path").map(|path| FilesystemPathInput { path }).ok_or_else(|| "path_required".to_string())).and_then(|input| crate::filesystem::delete_filesystem_entry(input.path)) {
-            Ok(()) => json_response(200, json!({ "deleted": true })),
-            Err(error) => error_response(400, &error),
+        ("DELETE", "/control/v1/fs") => Some({
+            let outcome = read_json::<FilesystemPathInput>(request)
+                .or_else(|_| {
+                    query_parameter(url, "path")
+                        .map(|path| FilesystemPathInput { path })
+                        .ok_or_else(|| "path_required".to_string())
+                })
+                .and_then(|input| {
+                    crate::filesystem::delete_filesystem_entry(input.path.clone())
+                        .map_err(|error| error.to_string())
+                        .map(|()| input.path)
+                });
+            match outcome {
+                Ok(path) => {
+                    emit_file_changed("delete", path, None);
+                    json_response(200, json!({ "deleted": true }))
+                }
+                Err(error) => error_response(400, &error),
+            }
         }),
         _ => None,
     }
@@ -1305,7 +1359,56 @@ fn validation_route(method: &str, path: &str, request: &mut Request) -> Option<R
     if method != "POST" || path != "/control/v1/validation/run" {
         return None;
     }
-    Some(match read_json::<ValidationInput>(request).and_then(|input| crate::validation::run_validation(input.cwd, input.commands)) {
+    let input = match read_json::<ValidationInput>(request) {
+        Ok(input) => input,
+        Err(error) => return Some(error_response(400, &error)),
+    };
+    let command_count = input
+        .commands
+        .iter()
+        .filter(|command| !command.trim().is_empty())
+        .count();
+    // `run_id` é o que deixa o consumidor casar started/completed quando duas validações correm ao
+    // mesmo tempo (cada requisição tem a própria thread). O correlation_id do envelope é por evento,
+    // não por rodada, então não serve para isso.
+    let run_id = nanoid::nanoid!(12);
+    let cwd = input.cwd;
+    emit_control_event(
+        "validation.started",
+        None,
+        json!({ "run_id": run_id, "cwd": cwd, "command_count": command_count }),
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = crate::validation::run_validation(cwd.clone(), input.commands);
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    // O payload leva o veredito, nunca o conteúdo: `stage` é a linha de comando e `output` é o
+    // stdout/stderr da rodada, os dois ficam fora (é a superfície que o Jev marcou como risco alto).
+    // `error` é token fixo do próprio módulo (`directory_not_found`), não texto livre.
+    let completion = match &outcome {
+        Ok(validation) => json!({
+            "run_id": run_id,
+            "cwd": cwd,
+            "command_count": command_count,
+            "duration_ms": duration_ms,
+            "success": validation.success,
+            "ran_any_command": validation.ran_any_command,
+        }),
+        // Mesmo no erro o `completed` sai: quem viu o `started` não pode ficar pendurado esperando um
+        // evento que nunca vem. `success: false` é o veredito honesto — a validação não passou.
+        Err(error) => json!({
+            "run_id": run_id,
+            "cwd": cwd,
+            "command_count": command_count,
+            "duration_ms": duration_ms,
+            "success": false,
+            "error": error,
+        }),
+    };
+    emit_control_event("validation.completed", None, completion);
+
+    Some(match outcome {
         Ok(validation) => json_response(200, json!({ "validation": validation })),
         Err(error) => error_response(400, &error),
     })
@@ -1575,10 +1678,21 @@ mod tests {
     /// que são globais do processo: em paralelo um sobrescreve o outro. O lock serializa só eles.
     static CREDENTIAL_TESTS: Mutex<()> = Mutex::new(());
 
-    fn http_request(port: u16, path: &str, body: Option<&str>) -> (u16, String) {
+    /// Requisição HTTP crua com método e auth à escolha. O `http_request` da suíte de pairing é o
+    /// atalho de POST sem token em cima desta.
+    fn http_call(
+        port: u16,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, String) {
         let body_text = body.unwrap_or("");
+        let auth = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
         let raw_request = format!(
-            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
             body_text.len()
         );
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to control server");
@@ -1595,6 +1709,37 @@ mod tests {
             .map(|(_, body)| body.trim().to_string())
             .unwrap_or_default();
         (status, body)
+    }
+
+    fn http_request(port: u16, path: &str, body: Option<&str>) -> (u16, String) {
+        http_call(port, "POST", path, None, body)
+    }
+
+    /// Índice da `n`-ésima ocorrência (a partir de 1) — separa os frames de cada rodada.
+    fn nth_at(buffer: &str, needle: &str, n: usize) -> usize {
+        buffer
+            .match_indices(needle)
+            .nth(n - 1)
+            .unwrap_or_else(|| panic!("{n}ª ocorrência de {needle} não apareceu: {buffer}"))
+            .0
+    }
+
+    /// Valor string de `key` no primeiro objeto depois de `needle` — só para casar o `run_id` entre
+    /// os dois frames de uma rodada sem trazer um parser JSON para dentro do teste.
+    fn string_field_after(buffer: &str, needle: &str, key: &str) -> String {
+        let scope = buffer
+            .split(needle)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{needle} não apareceu no stream: {buffer}"));
+        let needle = format!("\"{key}\":\"");
+        scope
+            .split(&needle)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{needle} não apareceu depois de {scope}"))
+            .split('"')
+            .next()
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn pairing_body(client_id: &str, code: &str) -> String {
@@ -1666,6 +1811,253 @@ mod tests {
             .as_str()
             .expect("access token")
             .to_string()
+    }
+
+    /// Step 2 da Task 4 nas rotas de fs e validação: cada mutação real aparece no SSE — e aparece sem
+    /// o conteúdo. Servidor, socket, token, rota, validação (processo de verdade) e stream são os de
+    /// produção; só o despacho é repetido aqui, porque o `handle_request` pede um `AppHandle` que o
+    /// teste não monta. Os ramos copiados são os mesmos do `handle_request`, incluindo o auth.
+    #[test]
+    fn routed_events_reach_the_sse_without_content() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
+        let port = server.server_addr().to_ip().expect("ip listener").port();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let method = request.method().to_string();
+                let url = request.url().to_string();
+                let path = endpoint_path(&url).to_string();
+                if let Some(response) = pairing_route(&method, &path, &mut request) {
+                    let _ = request.respond(response);
+                    continue;
+                }
+                let mut request = match events_route(&method, &path, request) {
+                    Some(restored) => restored,
+                    None => continue,
+                };
+                let Some(token) = bearer_token(&request) else {
+                    let _ = request.respond(unauthorized_response());
+                    continue;
+                };
+                if state().authenticate(token).is_err() {
+                    let _ = request.respond(unauthorized_response());
+                    continue;
+                }
+                let response = if path.starts_with("/control/v1/fs/") || path == "/control/v1/fs" {
+                    filesystem_route(&method, &path, &url, &mut request)
+                } else if path.starts_with("/control/v1/validation/") {
+                    validation_route(&method, &path, &mut request)
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| error_response(404, "control_route_not_found"));
+                let _ = request.respond(response);
+            }
+        });
+
+        // o auth real vale para estas rotas: sem token, 401 e nenhum evento
+        let (status, _) = http_call(
+            port,
+            "PUT",
+            "/control/v1/fs/write",
+            None,
+            Some(&json!({ "path": "x.txt", "content": "y" }).to_string()),
+        );
+        assert_eq!(status, 401, "rota de fs sem token precisa responder 401");
+
+        let token = pair_for_token(port);
+        let mut stream = sse_connect(port, &token);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let opening = sse_read_until_all(&mut stream, &["event: ready"], deadline);
+        assert!(
+            opening.starts_with("HTTP/1.1 200"),
+            "SSE precisa abrir com 200: {opening}"
+        );
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("alethe-control-events-{suffix}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sub = dir.join("sub");
+        let alvo = dir.join("alvo.txt");
+        let movido = dir.join("movido.txt");
+        let dir_text = dir.to_string_lossy().to_string();
+        let sub_text = sub.to_string_lossy().to_string();
+        let alvo_text = alvo.to_string_lossy().to_string();
+        let movido_text = movido.to_string_lossy().to_string();
+        // o marcador entra no arquivo, na linha de comando e na saída da validação: se vazar para o
+        // stream, ele aparece em algum dos três caminhos
+        let segredo = format!("SEGREDO-DO-USUARIO-{}", nanoid::nanoid!(8));
+
+        let (status, _) = http_call(
+            port,
+            "POST",
+            "/control/v1/fs/mkdir",
+            Some(&token),
+            Some(&json!({ "path": sub_text }).to_string()),
+        );
+        assert_eq!(status, 201);
+        let (status, _) = http_call(
+            port,
+            "PUT",
+            "/control/v1/fs/write",
+            Some(&token),
+            Some(&json!({ "path": alvo_text, "content": segredo }).to_string()),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = http_call(
+            port,
+            "POST",
+            "/control/v1/fs/move",
+            Some(&token),
+            Some(&json!({ "path": alvo_text, "destination": movido_text }).to_string()),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = http_call(
+            port,
+            "DELETE",
+            "/control/v1/fs",
+            Some(&token),
+            Some(&json!({ "path": movido_text }).to_string()),
+        );
+        assert_eq!(status, 200);
+
+        // três rodadas reais: uma que falha (e devolve a saída do comando ao chamador), uma que passa
+        // e uma que nem chega a executar
+        let (status, failing_body) = http_call(
+            port,
+            "POST",
+            "/control/v1/validation/run",
+            Some(&token),
+            Some(
+                &json!({ "cwd": dir_text, "commands": [format!("echo {segredo} & exit 1")] })
+                    .to_string(),
+            ),
+        );
+        assert_eq!(status, 200);
+        // o conteúdo existe e volta para quem pediu: na falha o `output` é o stdout/stderr real. Sem
+        // isto, a asserção de que o marcador não aparece no stream poderia passar por vacuidade.
+        assert!(
+            failing_body.contains(&segredo),
+            "a rodada que falha precisa devolver a saída do comando ao chamador: {failing_body}"
+        );
+        let (status, _) = http_call(
+            port,
+            "POST",
+            "/control/v1/validation/run",
+            Some(&token),
+            Some(&json!({ "cwd": dir_text, "commands": ["echo ok"] }).to_string()),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = http_call(
+            port,
+            "POST",
+            "/control/v1/validation/run",
+            Some(&token),
+            Some(&json!({ "cwd": dir.join("nao-existe").to_string_lossy(), "commands": ["echo x"] }).to_string()),
+        );
+        assert_eq!(status, 400);
+
+        let frames = sse_read_until_all(
+            &mut stream,
+            &[
+                "\"action\":\"mkdir\"",
+                "\"action\":\"write\"",
+                "\"action\":\"move\"",
+                "\"action\":\"delete\"",
+                "\"error\":\"directory_not_found\"",
+            ],
+            deadline,
+        );
+
+        // as quatro mutações de disco, com o caminho que mudou. `json!` porque o caminho no frame
+        // chega escapado (`C:\\Users\\...`), que é o encoding real do stream.
+        for (action, path) in [
+            ("mkdir", sub_text.as_str()),
+            ("write", alvo_text.as_str()),
+            ("move", alvo_text.as_str()),
+            ("delete", movido_text.as_str()),
+        ] {
+            let frame = format!("\"action\":\"{action}\"");
+            let at = frames
+                .find(&frame)
+                .unwrap_or_else(|| panic!("{frame} não chegou no SSE: {frames}"));
+            let expected = json!(path).to_string();
+            assert!(
+                frames[at..].contains(&expected),
+                "o evento {action} precisa dizer qual caminho mudou ({expected}): {frames}"
+            );
+        }
+        assert!(
+            frames.contains(&format!("\"destination\":{}", json!(movido_text))),
+            "o move precisa levar o destino: {frames}"
+        );
+        assert_eq!(
+            frames.matches("event: file.changed").count(),
+            4,
+            "cada mutação gera exatamente um evento: {frames}"
+        );
+
+        // started antes de completed, e os dois casados pelo mesmo run_id
+        for round in 1..=3 {
+            let started_at = nth_at(&frames, "event: validation.started", round);
+            let completed_at = nth_at(&frames, "event: validation.completed", round);
+            assert!(
+                started_at < completed_at,
+                "started precisa vir antes de completed na rodada {round}: {frames}"
+            );
+            assert_eq!(
+                string_field_after(&frames[started_at..], "validation.started", "run_id"),
+                string_field_after(&frames[completed_at..], "validation.completed", "run_id"),
+                "o run_id precisa casar started/completed na rodada {round}: {frames}"
+            );
+        }
+        let first_round = &frames[nth_at(&frames, "event: validation.started", 1)
+            ..nth_at(&frames, "event: validation.completed", 2)];
+        assert!(
+            first_round.contains("\"command_count\":1"),
+            "started precisa dizer quantos comandos foram configurados: {first_round}"
+        );
+        assert!(
+            first_round.contains("\"success\":false") && first_round.contains("\"ran_any_command\":true"),
+            "a rodada que falhou precisa levar o veredito, não o texto do comando: {first_round}"
+        );
+        assert!(
+            first_round.contains("\"duration_ms\":"),
+            "completed precisa levar a duração: {first_round}"
+        );
+        let second_round = &frames[nth_at(&frames, "event: validation.started", 2)
+            ..nth_at(&frames, "event: validation.completed", 3)];
+        assert!(
+            second_round.contains("\"success\":true") && second_round.contains("\"ran_any_command\":true"),
+            "a rodada que passou precisa levar success:true: {second_round}"
+        );
+        // a rodada que falhou antes de executar ainda fecha o ciclo
+        let third_round = &frames[nth_at(&frames, "event: validation.started", 3)..];
+        assert!(
+            third_round.contains("\"error\":\"directory_not_found\"")
+                && third_round.contains("\"success\":false"),
+            "a rodada que não executou precisa fechar o ciclo com o motivo: {third_round}"
+        );
+
+        // o conteúdo nunca sai: nem o do arquivo, nem a linha de comando, nem a saída da validação
+        assert!(
+            !frames.contains(&segredo),
+            "conteúdo do usuário vazou para o stream: {frames}"
+        );
+        for forbidden in ["\"stage\"", "\"output\"", "\"content\"", "\"stdout\""] {
+            assert!(
+                !frames.contains(forbidden),
+                "chave de conteúdo {forbidden} não pode sair no stream: {frames}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+        state().revoke(&token).expect("revoke test session");
     }
 
     /// Step 1 da Task 4: o stream SSE precisa carregar o ciclo de vida que só existe no event bus
