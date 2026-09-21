@@ -1435,9 +1435,25 @@ fn git_route(method: &str, path: &str, url: &str, request: &mut Request) -> Opti
                     Err(error) => error_response(400, &error),
                 }
             }),
-            "/control/v1/worktrees" => Some(match read_json::<WorktreeProvisionInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_provision(input.repo, input.agent_id, input.mode))) {
-                Ok(worktree) => json_response(201, json!({ "worktree": worktree })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/worktrees" => Some({
+                let outcome = read_json::<WorktreeProvisionInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::worktrees::worktree_provision(input.repo.clone(), input.agent_id, input.mode))
+                        .map(|worktree| (input.repo, worktree))
+                });
+                match outcome {
+                    Ok((repo, worktree)) => {
+                        // `agent_id` vai no envelope (convenção do bus: o webview filtra por ele) e no
+                        // payload (o consumidor do SSE lê o `data`). `repo` é o repositório principal; o
+                        // caminho da cópia de trabalho fica na resposta, não no evento.
+                        emit_control_event(
+                            "worktree.created",
+                            Some(worktree.agent_id.clone()),
+                            json!({ "agent_id": worktree.agent_id, "mode": worktree.mode, "repo": repo }),
+                        );
+                        json_response(201, json!({ "worktree": worktree }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
             path if path.starts_with("/control/v1/worktrees/") && path.ends_with("/lock") => {
                 Some(match read_json::<WorktreeLockInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_lock(input.repo, input.agent_id, input.reason))) {
@@ -1470,8 +1486,17 @@ fn git_route(method: &str, path: &str, url: &str, request: &mut Request) -> Opti
         let agent_id = path.trim_start_matches("/control/v1/worktrees/");
         let Some(repo) = query_parameter(url, "repo") else { return Some(error_response(400, "repo_required")); };
         let force = query_parameter(url, "force").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        return Some(match tauri::async_runtime::block_on(crate::worktrees::worktree_remove(repo, agent_id.to_string(), force)) {
-            Ok(()) => json_response(200, json!({ "deleted": true })),
+        return Some(match tauri::async_runtime::block_on(crate::worktrees::worktree_remove(repo.clone(), agent_id.to_string(), force)) {
+            Ok(()) => {
+                // `force` diz se o descarte levou trabalho não commitado junto — é o que o consumidor
+                // precisa para saber que aquilo ali não foi só uma pasta removida.
+                emit_control_event(
+                    "worktree.removed",
+                    Some(agent_id.to_string()),
+                    json!({ "agent_id": agent_id, "repo": repo, "force": force }),
+                );
+                json_response(200, json!({ "deleted": true }))
+            }
             Err(error) => error_response(400, &error),
         });
     }
@@ -2211,6 +2236,24 @@ mod tests {
         frames[start..end].to_string()
     }
 
+    /// O `data` do frame daquele tipo de evento, já como JSON — deixa afirmar envelope e payload
+    /// separadamente (os dois carregam `agent_id`, por exemplo).
+    fn sse_event_json(frames: &str, event_type: &str) -> Value {
+        let frame = frames
+            .split(&format!("event: {event_type}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("evento {event_type} não chegou no SSE: {frames}"));
+        let data = frame
+            .split_once("data: ")
+            .unwrap_or_else(|| panic!("frame de {event_type} sem data: {frame}"))
+            .1
+            .split("\n\n")
+            .next()
+            .unwrap_or_default();
+        serde_json::from_str::<Value>(data)
+            .unwrap_or_else(|error| panic!("data de {event_type} não é JSON ({error}): {data}"))
+    }
+
     /// Roda um comando de git de verdade no repo do teste.
     fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
         let output = crate::git_control::checked_output(dir, args)
@@ -2411,6 +2454,115 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&remote).expect("cleanup temp remote");
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+        state().revoke(&token).expect("revoke test session");
+    }
+
+    /// Step 2 da Task 4 no worktree: montar e remover a cópia de trabalho de um agente conta no SSE.
+    /// Repo temporário real, `git worktree` de verdade, rotas, auth e stream reais.
+    #[test]
+    fn worktree_routes_announce_creation_and_removal() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let port = control_server();
+        let token = pair_for_token(port);
+        let mut stream = sse_connect(port, &token);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let opening = sse_read_until_all(&mut stream, &["event: ready"], deadline);
+        assert!(
+            opening.starts_with("HTTP/1.1 200"),
+            "SSE precisa abrir com 200: {opening}"
+        );
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("alethe-control-worktree-{suffix}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        git_in(&dir, &["init"]);
+        git_in(&dir, &["config", "user.name", "Alethe Test"]);
+        git_in(&dir, &["config", "user.email", "alethe@example.invalid"]);
+        std::fs::write(dir.join("um.txt"), "um\n").expect("write tracked file");
+        git_in(&dir, &["add", "um.txt"]);
+        git_in(&dir, &["commit", "-m", "inicial"]);
+
+        let dir_text = dir.to_string_lossy().to_string();
+        let (status, body) = http_call(
+            port,
+            "POST",
+            "/control/v1/worktrees",
+            Some(&token),
+            Some(
+                &json!({ "repo": dir_text, "agent_id": "agente-teste", "mode": "gitWorktree" })
+                    .to_string(),
+            ),
+        );
+        assert_eq!(status, 201, "provision falhou: {body}");
+        let worktree_path = serde_json::from_str::<Value>(&body).expect("json body")["worktree"]["path"]
+            .as_str()
+            .expect("caminho da cópia de trabalho")
+            .to_string();
+        assert!(
+            std::path::Path::new(&worktree_path).is_dir(),
+            "a cópia de trabalho precisa existir no disco: {worktree_path}"
+        );
+
+        // a rota de remoção recebe o repo na query, então o caminho vai percent-encoded
+        let repo_query = dir_text.replace('\\', "%5C").replace(' ', "%20");
+        let (status, body) = http_call(
+            port,
+            "DELETE",
+            &format!("/control/v1/worktrees/agente-teste?repo={repo_query}&force=1"),
+            Some(&token),
+            None,
+        );
+        assert_eq!(status, 200, "remoção falhou: {body}");
+        assert!(
+            !std::path::Path::new(&worktree_path).exists(),
+            "a cópia de trabalho precisa ter saído do disco: {worktree_path}"
+        );
+
+        let frames = sse_read_until_all(
+            &mut stream,
+            &["event: worktree.created", "event: worktree.removed"],
+            deadline,
+        );
+        let created = sse_event_json(&frames, "worktree.created");
+        assert_eq!(
+            created["agent_id"], "agente-teste",
+            "o envelope do bus precisa levar o agente: {created}"
+        );
+        assert_eq!(
+            created["data"]["agent_id"], "agente-teste",
+            "o payload precisa dizer de que agente é a cópia: {created}"
+        );
+        assert_eq!(
+            created["data"]["mode"], "gitWorktree",
+            "o payload precisa dizer em que modo a cópia foi feita: {created}"
+        );
+        assert_eq!(
+            created["data"]["repo"], dir_text,
+            "o payload precisa dizer de que repo é a cópia: {created}"
+        );
+        let removed = sse_event_json(&frames, "worktree.removed");
+        assert_eq!(removed["data"]["agent_id"], "agente-teste", "{removed}");
+        assert_eq!(removed["data"]["repo"], dir_text, "{removed}");
+        assert_eq!(
+            removed["data"]["force"], true,
+            "a remoção precisa dizer se o descarte foi forçado: {removed}"
+        );
+        assert!(
+            !frames.contains(&json!(worktree_path).to_string()),
+            "o caminho da cópia de trabalho fica na resposta, não no evento: {frames}"
+        );
+        assert_eq!(
+            frames.matches("event: worktree.created").count(),
+            1,
+            "exatamente um evento de criação: {frames}"
+        );
+
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
         state().revoke(&token).expect("revoke test session");
     }
