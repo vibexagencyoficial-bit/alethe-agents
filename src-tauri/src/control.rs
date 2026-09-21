@@ -404,6 +404,19 @@ fn emit_file_changed(action: &str, path: String, destination: Option<String>) {
     emit_control_event("file.changed", None, payload);
 }
 
+/// O que a rota fez no repositório: `action` + `repo` (o caminho que a rota usou), mais `path_count`
+/// em quem recebeu caminhos e `mode` no reset. Ficam de fora a mensagem de commit e a saída do git
+/// (pull/push/commit devolvem stdout ao chamador, mas o evento é persistido pelo consumidor) — e por
+/// isso não vai a lista de caminhos, só quantos foram: um `stage` de mil arquivos não pode inflar o
+/// evento guardado. Quem quiser o detalhe pede `git status`/`git diff`.
+fn emit_git_changed(action: &str, repo: String, extra: &[(&str, Value)]) {
+    let mut payload = json!({ "action": action, "repo": repo });
+    for (key, value) in extra {
+        payload[key] = value.clone();
+    }
+    emit_control_event("git.changed", None, payload);
+}
+
 impl ControlState {
     fn new() -> Self {
         match load_sessions() {
@@ -1268,49 +1281,151 @@ fn git_route(method: &str, path: &str, url: &str, request: &mut Request) -> Opti
     }
     if method == "POST" {
         return match path {
-            "/control/v1/git/init" => Some(match read_json::<GitInitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_init(input.path))) {
-                Ok(repo_root) => json_response(201, json!({ "repo_root": repo_root })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/init" => Some({
+                let outcome = read_json::<GitInitInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_init(input.path))
+                });
+                match outcome {
+                    Ok(repo_root) => {
+                        emit_git_changed("init", repo_root.clone(), &[]);
+                        json_response(201, json!({ "repo_root": repo_root }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/stage" => Some(match read_json::<GitPathsInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_stage(input.repo_root, input.paths))) {
-                Ok(()) => json_response(200, json!({ "staged": true })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/stage" => Some({
+                let outcome = read_json::<GitPathsInput>(request).and_then(|input| {
+                    let path_count = input.paths.len();
+                    tauri::async_runtime::block_on(crate::git_control::git_stage(input.repo_root.clone(), input.paths))
+                        .map(|()| (input.repo_root, path_count))
+                });
+                match outcome {
+                    Ok((repo, path_count)) => {
+                        emit_git_changed("stage", repo, &[("path_count", json!(path_count))]);
+                        json_response(200, json!({ "staged": true }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/unstage" => Some(match read_json::<GitPathsInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_unstage(input.repo_root, input.paths))) {
-                Ok(()) => json_response(200, json!({ "unstaged": true })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/unstage" => Some({
+                let outcome = read_json::<GitPathsInput>(request).and_then(|input| {
+                    let path_count = input.paths.len();
+                    tauri::async_runtime::block_on(crate::git_control::git_unstage(input.repo_root.clone(), input.paths))
+                        .map(|()| (input.repo_root, path_count))
+                });
+                match outcome {
+                    Ok((repo, path_count)) => {
+                        emit_git_changed("unstage", repo, &[("path_count", json!(path_count))]);
+                        json_response(200, json!({ "unstaged": true }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/discard" => Some(match read_json::<GitDiscardInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_discard(input.repo_root, input.paths, input.untracked))) {
-                Ok(()) => json_response(200, json!({ "discarded": true })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/discard" => Some({
+                let outcome = read_json::<GitDiscardInput>(request).and_then(|input| {
+                    let path_count = input.paths.len();
+                    tauri::async_runtime::block_on(crate::git_control::git_discard(input.repo_root.clone(), input.paths, input.untracked))
+                        .map(|()| (input.repo_root, path_count))
+                });
+                match outcome {
+                    Ok((repo, path_count)) => {
+                        emit_git_changed("discard", repo, &[("path_count", json!(path_count))]);
+                        json_response(200, json!({ "discarded": true }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/commit" => Some(match read_json::<GitCommitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_commit(input.repo_root, input.message))) {
-                Ok(output) => json_response(200, json!({ "committed": true, "output": output })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/commit" => Some({
+                let outcome = read_json::<GitCommitInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_commit(input.repo_root.clone(), input.message))
+                        .map(|output| (input.repo_root, output))
+                });
+                match outcome {
+                    Ok((repo, output)) => {
+                        emit_git_changed("commit", repo, &[]);
+                        json_response(200, json!({ "committed": true, "output": output }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/pull" => Some(match read_json::<GitInitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_pull(input.path))) {
-                Ok(output) => json_response(200, json!({ "pulled": true, "output": output })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/pull" => Some({
+                let outcome = read_json::<GitInitInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_pull(input.path.clone()))
+                        .map(|output| (input.path, output))
+                });
+                match outcome {
+                    Ok((repo, output)) => {
+                        emit_git_changed("pull", repo, &[]);
+                        json_response(200, json!({ "pulled": true, "output": output }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/push" => Some(match read_json::<GitInitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_push(input.path))) {
-                Ok(output) => json_response(200, json!({ "pushed": true, "output": output })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/push" => Some({
+                let outcome = read_json::<GitInitInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_push(input.path.clone()))
+                        .map(|output| (input.path, output))
+                });
+                match outcome {
+                    Ok((repo, output)) => {
+                        emit_git_changed("push", repo, &[]);
+                        json_response(200, json!({ "pushed": true, "output": output }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/branch" => Some(match read_json::<GitBranchInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_create_branch_from_commit(input.repo, input.hash, input.branch_name))) {
-                Ok(()) => json_response(201, json!({ "created": true })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/branch" => Some({
+                let outcome = read_json::<GitBranchInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_create_branch_from_commit(input.repo.clone(), input.hash, input.branch_name))
+                        .map(|()| input.repo)
+                });
+                match outcome {
+                    Ok(repo) => {
+                        emit_git_changed("branch", repo, &[]);
+                        json_response(201, json!({ "created": true }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/cherry-pick" => Some(match read_json::<GitHashInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_cherry_pick_commit(input.repo, input.hash))) {
-                Ok(output) => json_response(200, json!({ "cherry_picked": true, "output": output })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/cherry-pick" => Some({
+                let outcome = read_json::<GitHashInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_cherry_pick_commit(input.repo.clone(), input.hash))
+                        .map(|output| (input.repo, output))
+                });
+                match outcome {
+                    Ok((repo, output)) => {
+                        emit_git_changed("cherry-pick", repo, &[]);
+                        json_response(200, json!({ "cherry_picked": true, "output": output }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/revert" => Some(match read_json::<GitHashInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_revert_commit(input.repo, input.hash))) {
-                Ok(output) => json_response(200, json!({ "reverted": true, "output": output })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/revert" => Some({
+                let outcome = read_json::<GitHashInput>(request).and_then(|input| {
+                    tauri::async_runtime::block_on(crate::git_control::git_revert_commit(input.repo.clone(), input.hash))
+                        .map(|output| (input.repo, output))
+                });
+                match outcome {
+                    Ok((repo, output)) => {
+                        emit_git_changed("revert", repo, &[]);
+                        json_response(200, json!({ "reverted": true, "output": output }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
-            "/control/v1/git/reset" => Some(match read_json::<GitResetInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_reset_to_commit(input.repo, input.hash, input.mode))) {
-                Ok(()) => json_response(200, json!({ "reset": true })),
-                Err(error) => error_response(400, &error),
+            "/control/v1/git/reset" => Some({
+                let outcome = read_json::<GitResetInput>(request).and_then(|input| {
+                    let mode = input.mode.clone();
+                    tauri::async_runtime::block_on(crate::git_control::git_reset_to_commit(input.repo.clone(), input.hash, input.mode))
+                        .map(|()| (input.repo, mode))
+                });
+                match outcome {
+                    Ok((repo, mode)) => {
+                        emit_git_changed("reset", repo, &[("mode", json!(mode))]);
+                        json_response(200, json!({ "reset": true }))
+                    }
+                    Err(error) => error_response(400, &error),
+                }
             }),
             "/control/v1/worktrees" => Some(match read_json::<WorktreeProvisionInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_provision(input.repo, input.agent_id, input.mode))) {
                 Ok(worktree) => json_response(201, json!({ "worktree": worktree })),
@@ -1715,6 +1830,52 @@ mod tests {
         http_call(port, "POST", path, None, body)
     }
 
+    /// Servidor de controle real (porta efêmera) atendendo pairing, events, fs, git, worktrees e
+    /// validação. O despacho repete os ramos do `handle_request`, que pede um `AppHandle` que o teste
+    /// não monta; tudo o mais é o de produção — inclusive o 401 de rota autenticada sem token.
+    fn control_server() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
+        let port = server.server_addr().to_ip().expect("ip listener").port();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let method = request.method().to_string();
+                let url = request.url().to_string();
+                let path = endpoint_path(&url).to_string();
+                if let Some(response) = pairing_route(&method, &path, &mut request) {
+                    let _ = request.respond(response);
+                    continue;
+                }
+                let mut request = match events_route(&method, &path, request) {
+                    Some(restored) => restored,
+                    None => continue,
+                };
+                let Some(token) = bearer_token(&request) else {
+                    let _ = request.respond(unauthorized_response());
+                    continue;
+                };
+                if state().authenticate(token).is_err() {
+                    let _ = request.respond(unauthorized_response());
+                    continue;
+                }
+                let response = if path.starts_with("/control/v1/fs/") || path == "/control/v1/fs" {
+                    filesystem_route(&method, &path, &url, &mut request)
+                } else if path.starts_with("/control/v1/git/")
+                    || path == "/control/v1/worktrees"
+                    || path.starts_with("/control/v1/worktrees/")
+                {
+                    git_route(&method, &path, &url, &mut request)
+                } else if path.starts_with("/control/v1/validation/") {
+                    validation_route(&method, &path, &mut request)
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| error_response(404, "control_route_not_found"));
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
     /// Índice da `n`-ésima ocorrência (a partir de 1) — separa os frames de cada rodada.
     fn nth_at(buffer: &str, needle: &str, n: usize) -> usize {
         buffer
@@ -1822,40 +1983,7 @@ mod tests {
         let _guard = CREDENTIAL_TESTS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
-        let port = server.server_addr().to_ip().expect("ip listener").port();
-        std::thread::spawn(move || {
-            for mut request in server.incoming_requests() {
-                let method = request.method().to_string();
-                let url = request.url().to_string();
-                let path = endpoint_path(&url).to_string();
-                if let Some(response) = pairing_route(&method, &path, &mut request) {
-                    let _ = request.respond(response);
-                    continue;
-                }
-                let mut request = match events_route(&method, &path, request) {
-                    Some(restored) => restored,
-                    None => continue,
-                };
-                let Some(token) = bearer_token(&request) else {
-                    let _ = request.respond(unauthorized_response());
-                    continue;
-                };
-                if state().authenticate(token).is_err() {
-                    let _ = request.respond(unauthorized_response());
-                    continue;
-                }
-                let response = if path.starts_with("/control/v1/fs/") || path == "/control/v1/fs" {
-                    filesystem_route(&method, &path, &url, &mut request)
-                } else if path.starts_with("/control/v1/validation/") {
-                    validation_route(&method, &path, &mut request)
-                } else {
-                    None
-                }
-                .unwrap_or_else(|| error_response(404, "control_route_not_found"));
-                let _ = request.respond(response);
-            }
-        });
+        let port = control_server();
 
         // o auth real vale para estas rotas: sem token, 401 e nenhum evento
         let (status, _) = http_call(
