@@ -72,6 +72,18 @@ path relative to the repository.
    [`docs/CHANGELOG.md`](docs/CHANGELOG.md) in the same task, under the **`[Unreleased]`** section
    (top of the file), with a short, objective, user-facing description. Never skip this step — the
    changelog is the source for release notes.
+6. **Jev (`jev-orchestrator` MCP) is the decider and orchestrator.** When it is available, every
+   decision goes through it: `jev_decide` with `question_set` = `orchestration` (route, priority,
+   scope), `definition_of_done` (before claiming done), `code_review` (code/diff), `security_surface`
+   (API, route, auth, credentials, permissions); `jev_select_tool` when the tool surface is
+   ambiguous (act on `effective_action`, and read the `safety` block separately from the choice).
+   A non-empty `escalate` means confidence below the floor: do not act on that answer — follow the
+   owner's explicit request and report the escalation, or stop and ask when the decision is
+   irreversible. Measured evidence (real test, DB, log) beats Jev's probability; Jev is advisory and
+   never a security boundary nor a substitute for running the tests. End every response that involved
+   a decision by listing the Jev calls made (`label` + `question_set` + the answer that decided,
+   including `escalate`). Never send `.env`, `ssh/` or credential content to Jev — the text goes to
+   `api.typesafe.ai`. Full text: [`../AGENTS.md`](../AGENTS.md) section 0.
 
 ## 6. Architecture at a glance
 

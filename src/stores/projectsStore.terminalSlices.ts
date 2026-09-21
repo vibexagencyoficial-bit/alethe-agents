@@ -400,6 +400,7 @@ export function createTerminalsSlice({ get, update, updateTerminal }: SliceCtx):
           await worktreeRemove(repo, terminal.worktreeAgentId, true)
         } catch (firstErr) {
           if (String(firstErr).includes('worktree_not_found')) {
+            // The desired end state is already true.
           } else {
             await new Promise((resolve) => setTimeout(resolve, 400))
             try {

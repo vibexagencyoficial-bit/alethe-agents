@@ -141,6 +141,13 @@ pub fn start_listener(app: AppHandle) {
         for mut request in server.incoming_requests() {
             let url = request.url().to_string();
 
+            // O Control Plane possui autenticação própria e precisa ler o body no
+            // módulo de contrato. Ele é despachado antes do token legado X-Alethe-Token.
+            if crate::control::is_control_path(&url) {
+                crate::control::handle_request(app.clone(), request, &url, port);
+                continue;
+            }
+
             if !check_token(&request) {
                 let _ = request.respond(tiny_http::Response::empty(401));
                 continue;

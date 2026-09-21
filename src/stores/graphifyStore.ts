@@ -89,7 +89,7 @@ export const useGraphifyStore = create<GraphifyState>((set, get) => ({
             return
           }
         } catch {
-                                                                               
+          // Graph generation can still be writing; the outer loop retries it.
         }
       }
 

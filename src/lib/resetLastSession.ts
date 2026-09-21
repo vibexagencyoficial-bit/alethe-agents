@@ -244,8 +244,8 @@ export async function resetLastSession(): Promise<ResetLastSessionResult> {
       }
 
       resumed++
-    } catch {
-                                                 
+    } catch (error) {
+      console.warn('[resetLastSession] falha ao retomar uma sessão', target.ptyId, error)
     } finally {
       releaseSpawnSlot()
     }

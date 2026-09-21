@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 mod activity_stats;
 mod agent_cost;
 mod agent_events;
@@ -19,6 +21,7 @@ mod codex_sessions;
 mod codex_usage;
 mod conflict_resolution;
 mod contract_check;
+mod control;
 mod crash_watch;
 mod cursor_sessions;
 mod diagnostics;

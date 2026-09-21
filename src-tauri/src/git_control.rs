@@ -428,7 +428,10 @@ fn seed_gitignore_if_missing(dir: &Path) {
 
 fn git_init_inner(path: String) -> Result<String, String> {
     if let Ok(root) = repository_root(&path) {
-        return Ok(root.to_string_lossy().into_owned());
+        let requested = resolve_input_directory(&path)?;
+        if requested == root {
+            return Ok(root.to_string_lossy().into_owned());
+        }
     }
     let dir = resolve_input_directory(&path)?;
     checked_output(&dir, &["init", "-b", "main"])?;

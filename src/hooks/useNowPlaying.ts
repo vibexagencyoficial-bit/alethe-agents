@@ -57,7 +57,7 @@ function saveLastTrack(np: NowPlaying): void {
   try {
     writeScopedStorage(LAST_TRACK_KEY, JSON.stringify(np))
   } catch {
-                                             
+    // Local storage is optional; failure must not interrupt the home view.
   }
 }
 

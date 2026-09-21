@@ -36,7 +36,8 @@ pub fn command_builder_for_terminal(
 ) -> CommandBuilder {
     let trimmed = initial_command
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .filter(|value| !value.eq_ignore_ascii_case("shell"));
 
     let mut builder = match trimmed {
         Some(command) => {

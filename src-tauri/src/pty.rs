@@ -738,8 +738,12 @@ pub async fn spawn_pty(
 /// path, which takes the global session lock before this one — and `write_pty` starts by taking
 /// that same global lock, so a single slow kill stops every terminal in the app from accepting a
 /// keystroke while output, which never touches the lock, keeps arriving.
+fn child_process_id(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) -> Option<u32> {
+    child.as_ref().lock().ok().and_then(|child| child.process_id())
+}
+
 fn kill_tree_without_holding_child(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) {
-    let pid = child.lock().ok().and_then(|mut child| child.process_id());
+    let pid = child_process_id(child);
     if let Some(pid) = pid {
         kill_process_tree(pid);
     }

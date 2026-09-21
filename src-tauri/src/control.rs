@@ -1,0 +1,1323 @@
+//! Control Plane local do Alethe para integração real com o Transcripts.
+//!
+//! O listener usa somente loopback. Health/version/capabilities e o pareamento são públicos;
+//! qualquer operação que possa criar processos, escrever arquivos ou alterar Git exige um token
+//! Bearer emitido no pareamento. Os hashes das sessões ficam no Credential Manager/Keyring do SO.
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Manager};
+use tiny_http::{Header, Request, Response, StatusCode};
+
+const PREFIX: &str = "/control/v1";
+const MAX_BODY: usize = 64 * 1024;
+const PAIRING_WINDOW: Duration = Duration::from_secs(120);
+const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CREDENTIAL_SERVICE: &str = "com.kc1t.alethe.control-plane";
+const LEGACY_CREDENTIAL_USER: &str = "sessions";
+const SESSION_INDEX_PREFIX: &str = "sessions-index-";
+const SESSION_CREDENTIAL_PREFIX: &str = "session-";
+const SESSION_INDEX_SHARDS: &str = "0123456789abcdef";
+
+static INSTANCE_ID: OnceLock<String> = OnceLock::new();
+static STATE: OnceLock<ControlState> = OnceLock::new();
+static EVENT_SUBSCRIBERS: OnceLock<Mutex<Vec<Sender<String>>>> = OnceLock::new();
+
+#[derive(Clone, Debug, Deserialize)]
+struct PairingStartInput {
+    client_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PairingCompleteInput {
+    client_id: String,
+    pairing_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalStartInput {
+    cols: Option<u16>,
+    rows: Option<u16>,
+    id: Option<String>,
+    command: Option<String>,
+    cwd: Option<String>,
+    extra_args: Option<Vec<String>>,
+    launcher_override: Option<String>,
+    env: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalInput {
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSpawnInput {
+    agent: String,
+    task: Option<String>,
+    id: Option<String>,
+    cwd: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    extra_args: Option<Vec<String>>,
+    launcher_override: Option<String>,
+    env: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMessageInput {
+    message: Option<String>,
+    data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemPathInput {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemWriteInput {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemMoveInput {
+    path: String,
+    destination: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitInitInput {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitPathsInput {
+    repo_root: String,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitDiscardInput {
+    repo_root: String,
+    paths: Vec<String>,
+    untracked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitInput {
+    repo_root: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitBranchInput {
+    repo: String,
+    hash: String,
+    branch_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHashInput {
+    repo: String,
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitResetInput {
+    repo: String,
+    hash: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeProvisionInput {
+    repo: String,
+    agent_id: String,
+    mode: crate::worktrees::WorktreeMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeAgentInput {
+    repo: String,
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeLockInput {
+    repo: String,
+    agent_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeCommitInput {
+    repo: String,
+    agent_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidationInput {
+    cwd: String,
+    commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredSession {
+    client_id: String,
+    token_hash: String,
+    created_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PairingChallenge {
+    client_id: String,
+    code: String,
+    expires_at: SystemTime,
+}
+
+struct ControlState {
+    pairing: Mutex<Option<PairingChallenge>>,
+    sessions: Mutex<Vec<StoredSession>>,
+    storage_error: Mutex<Option<String>>,
+}
+
+fn instance_id() -> &'static str {
+    INSTANCE_ID.get_or_init(|| nanoid::nanoid!(21))
+}
+
+fn state() -> &'static ControlState {
+    STATE.get_or_init(ControlState::new)
+}
+
+fn event_subscribers() -> &'static Mutex<Vec<Sender<String>>> {
+    EVENT_SUBSCRIBERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn sse_frame(event: &str, payload: &Value) -> String {
+    format!("event: {event}\ndata: {}\n\n", payload)
+}
+
+pub fn publish_event(event: &str, payload: &Value) {
+    let frame = sse_frame(event, payload);
+    let Ok(mut subscribers) = event_subscribers().lock() else {
+        return;
+    };
+    subscribers.retain(|subscriber| subscriber.send(frame.clone()).is_ok());
+}
+
+fn subscribe_events() -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    if let Ok(mut subscribers) = event_subscribers().lock() {
+        subscribers.push(sender);
+    }
+    receiver
+}
+
+fn stream_events(mut writer: Box<dyn Write + Send + 'static>, receiver: Receiver<String>) {
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+    if writer.write_all(header).and_then(|_| writer.flush()).is_err() {
+        return;
+    }
+    let ready = sse_frame(
+        "ready",
+        &json!({ "service": "alethe-control", "instance_id": instance_id() }),
+    );
+    if writer
+        .write_all(ready.as_bytes())
+        .and_then(|_| writer.flush())
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(frame) => {
+                if writer
+                    .write_all(frame.as_bytes())
+                    .and_then(|_| writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if writer.write_all(b": keep-alive\n\n").and_then(|_| writer.flush()).is_err() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+impl ControlState {
+    fn new() -> Self {
+        match load_sessions() {
+            Ok(sessions) => Self {
+                pairing: Mutex::new(None),
+                sessions: Mutex::new(sessions),
+                storage_error: Mutex::new(None),
+            },
+            Err(error) => Self {
+                pairing: Mutex::new(None),
+                sessions: Mutex::new(Vec::new()),
+                storage_error: Mutex::new(Some(error)),
+            },
+        }
+    }
+
+    fn storage_ready(&self) -> Result<(), String> {
+        let error = self
+            .storage_error
+            .lock()
+            .map_err(|_| "credential_store_lock_failed".to_string())?;
+        match error.as_ref() {
+            Some(error) => Err(format!("credential_store_unavailable: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    fn start_pairing(&self, client_id: String) -> Result<Value, String> {
+        let client_id = valid_client_id(&client_id)?;
+        self.storage_ready()?;
+        let expires_at = SystemTime::now() + PAIRING_WINDOW;
+        let challenge = PairingChallenge {
+            client_id: client_id.clone(),
+            code: nanoid::nanoid!(32),
+            expires_at,
+        };
+        let pairing_code = challenge.code.clone();
+        self.pairing
+            .lock()
+            .map_err(|_| "pairing_lock_failed".to_string())?
+            .replace(challenge);
+        Ok(json!({
+            "client_id": client_id,
+            "pairing_code": pairing_code,
+            "expires_at": unix_seconds(expires_at),
+            "expires_in_seconds": PAIRING_WINDOW.as_secs(),
+            "one_time": true
+        }))
+    }
+
+    fn complete_pairing(&self, input: PairingCompleteInput) -> Result<Value, String> {
+        let client_id = valid_client_id(&input.client_id)?;
+        if input.pairing_code.trim().is_empty() {
+            return Err("pairing_code_required".to_string());
+        }
+        self.storage_ready()?;
+        let challenge = self
+            .pairing
+            .lock()
+            .map_err(|_| "pairing_lock_failed".to_string())?
+            .clone()
+            .ok_or_else(|| "pairing_not_started".to_string())?;
+        if challenge.expires_at <= SystemTime::now() {
+            let _ = self.pairing.lock().map(|mut pairing| pairing.take());
+            return Err("pairing_expired".to_string());
+        }
+        if challenge.client_id != client_id
+            || !constant_time_equal(&challenge.code, input.pairing_code.trim())
+        {
+            return Err("invalid_pairing_code".to_string());
+        }
+
+        let token = nanoid::nanoid!(48);
+        let now = SystemTime::now();
+        let session = StoredSession {
+            client_id: client_id.clone(),
+            token_hash: token_hash(&token),
+            created_at: unix_seconds(now),
+            expires_at: unix_seconds(now + SESSION_LIFETIME),
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session_lock_failed".to_string())?;
+        let mut next = sessions.clone();
+        next.retain(|entry| entry.expires_at > unix_seconds(now));
+        next.push(session.clone());
+        persist_sessions(&next)?;
+        *sessions = next;
+        drop(sessions);
+        self.pairing
+            .lock()
+            .map_err(|_| "pairing_lock_failed".to_string())?
+            .take();
+        Ok(json!({
+            "client_id": client_id,
+            "access_token": token,
+            "token_type": "Bearer",
+            "created_at": session.created_at,
+            "expires_at": session.expires_at
+        }))
+    }
+
+    fn authenticate(&self, token: &str) -> Result<StoredSession, String> {
+        self.storage_ready()?;
+        let hash = token_hash(token);
+        let now = unix_seconds(SystemTime::now());
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session_lock_failed".to_string())?;
+        if sessions.iter().any(|session| session.expires_at <= now) {
+            sessions.retain(|session| session.expires_at > now);
+            persist_sessions(&sessions)?;
+        }
+        sessions
+            .iter()
+            .find(|session| constant_time_equal(&session.token_hash, &hash))
+            .cloned()
+            .ok_or_else(|| "invalid_access_token".to_string())
+    }
+
+    fn rotate(&self, token: &str) -> Result<Value, String> {
+        let current = self.authenticate(token)?;
+        let replacement_token = nanoid::nanoid!(48);
+        let now = SystemTime::now();
+        let replacement = StoredSession {
+            client_id: current.client_id.clone(),
+            token_hash: token_hash(&replacement_token),
+            created_at: unix_seconds(now),
+            expires_at: unix_seconds(now + SESSION_LIFETIME),
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session_lock_failed".to_string())?;
+        let mut next = sessions.clone();
+        next.retain(|session| session.token_hash != current.token_hash);
+        next.push(replacement.clone());
+        persist_sessions(&next)?;
+        *sessions = next;
+        Ok(json!({
+            "client_id": replacement.client_id,
+            "access_token": replacement_token,
+            "token_type": "Bearer",
+            "created_at": replacement.created_at,
+            "expires_at": replacement.expires_at
+        }))
+    }
+
+    fn revoke(&self, token: &str) -> Result<Value, String> {
+        let current = self.authenticate(token)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session_lock_failed".to_string())?;
+        let next = sessions
+            .iter()
+            .filter(|session| session.token_hash != current.token_hash)
+            .cloned()
+            .collect::<Vec<_>>();
+        persist_sessions(&next)?;
+        *sessions = next;
+        Ok(json!({ "revoked": true, "client_id": current.client_id }))
+    }
+}
+
+fn keyring_entry(user: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(CREDENTIAL_SERVICE, user)
+        .map_err(|error| format!("credential_entry_unavailable: {error}"))
+}
+
+fn session_entry(token_hash: &str) -> Result<keyring::Entry, String> {
+    keyring_entry(&format!("{SESSION_CREDENTIAL_PREFIX}{token_hash}"))
+}
+
+fn session_index_entry(shard: char) -> Result<keyring::Entry, String> {
+    keyring_entry(&format!("{SESSION_INDEX_PREFIX}{shard}"))
+}
+
+fn session_index_shard(token_hash: &str) -> char {
+    token_hash.chars().next().unwrap_or('0')
+}
+
+fn load_index_hashes() -> Result<Vec<String>, String> {
+    let mut hashes = Vec::new();
+    for shard in SESSION_INDEX_SHARDS.chars() {
+        match session_index_entry(shard)?.get_password() {
+            Ok(value) => {
+                for hash in value.lines().map(str::trim).filter(|hash| !hash.is_empty()) {
+                    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err("credential_index_invalid".to_string());
+                    }
+                    if !hashes.iter().any(|existing| existing == hash) {
+                        hashes.push(hash.to_string());
+                    }
+                }
+            }
+            Err(keyring::Error::NoEntry) => {}
+            Err(error) => return Err(format!("credential_index_read_failed: {error}")),
+        }
+    }
+    Ok(hashes)
+}
+
+fn load_sessions() -> Result<Vec<StoredSession>, String> {
+    let hashes = load_index_hashes()?;
+    if !hashes.is_empty() {
+        return hashes
+            .into_iter()
+            .map(|hash| {
+                let serialized = session_entry(&hash)?.get_password().map_err(|error| match error {
+                    keyring::Error::NoEntry => "credential_session_missing".to_string(),
+                    other => format!("credential_session_read_failed: {other}"),
+                })?;
+                let session: StoredSession = serde_json::from_str(&serialized)
+                    .map_err(|error| format!("credential_session_data_invalid: {error}"))?;
+                if session.token_hash != hash {
+                    return Err("credential_session_hash_mismatch".to_string());
+                }
+                Ok(session)
+            })
+            .collect();
+    }
+
+    match keyring_entry(LEGACY_CREDENTIAL_USER)?.get_password() {
+        Ok(serialized) => serde_json::from_str(&serialized)
+            .map_err(|error| format!("credential_data_invalid: {error}")),
+        Err(keyring::Error::NoEntry) => Ok(Vec::new()),
+        Err(error) => Err(format!("credential_read_failed: {error}")),
+    }
+}
+
+fn persist_sessions(sessions: &[StoredSession]) -> Result<(), String> {
+    let previous_hashes = load_index_hashes()?;
+    let desired_hashes: HashSet<&str> = sessions.iter().map(|s| s.token_hash.as_str()).collect();
+    for session in sessions {
+        let serialized = serde_json::to_string(session)
+            .map_err(|error| format!("credential_session_data_encode_failed: {error}"))?;
+        session_entry(&session.token_hash)?
+            .set_password(&serialized)
+            .map_err(|error| format!("credential_session_write_failed: {error}"))?;
+    }
+    for shard in SESSION_INDEX_SHARDS.chars() {
+        let value = sessions
+            .iter()
+            .filter(|session| session_index_shard(&session.token_hash) == shard)
+            .map(|session| session.token_hash.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = session_index_entry(shard)?;
+        if value.is_empty() {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(format!("credential_index_delete_failed: {error}")),
+            }
+        } else {
+            entry
+                .set_password(&value)
+                .map_err(|error| format!("credential_index_write_failed: {error}"))?;
+        }
+    }
+    for hash in previous_hashes {
+        if !desired_hashes.contains(hash.as_str()) {
+            match session_entry(&hash)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(format!("credential_session_delete_failed: {error}")),
+            }
+        }
+    }
+    match keyring_entry(LEGACY_CREDENTIAL_USER)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("credential_legacy_delete_failed: {error}")),
+    }
+}
+
+fn valid_client_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("client_id_required".to_string());
+    }
+    if value.len() > 128 {
+        return Err("client_id_too_long".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+fn constant_time_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut difference = (left.len() ^ right.len()) as u8;
+    for index in 0..left.len().max(right.len()) {
+        difference |= left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0);
+    }
+    difference == 0
+}
+
+fn unix_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn json_response(status: u16, payload: Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    let header = Header::from_bytes("Content-Type", "application/json; charset=utf-8")
+        .expect("static control-plane header");
+    Response::from_string(payload.to_string())
+        .with_status_code(StatusCode(status))
+        .with_header(header)
+}
+
+fn error_response(status: u16, error: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(status, json!({ "error": error }))
+}
+
+fn endpoint_path(url: &str) -> &str {
+    url.split_once('?').map(|(path, _)| path).unwrap_or(url)
+}
+
+pub fn is_control_path(url: &str) -> bool {
+    let path = endpoint_path(url);
+    path == PREFIX || path.starts_with("/control/v1/")
+}
+
+fn query_parameter(url: &str, key: &str) -> Option<String> {
+    url.split_once('?')?.1.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        if name != key {
+            return None;
+        }
+        urlencoding::decode(value).ok().map(|decoded| decoded.into_owned())
+    })
+}
+
+fn read_json<T: DeserializeOwned>(request: &mut Request) -> Result<T, String> {
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take((MAX_BODY + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| "request_body_read_failed".to_string())?;
+    if body.len() > MAX_BODY {
+        return Err("request_body_too_large".to_string());
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_json_body".to_string())
+}
+
+fn health(port: u16) -> Value {
+    json!({
+        "service": "alethe-control",
+        "version": "1",
+        "ready": true,
+        "instance_id": instance_id(),
+        "bind": "127.0.0.1",
+        "port": port
+    })
+}
+
+fn version() -> Value {
+    json!({
+        "service": "alethe-control",
+        "protocol": "1",
+        "application": env!("CARGO_PKG_VERSION"),
+        "instance_id": instance_id()
+    })
+}
+
+fn capabilities() -> Value {
+    json!({
+        "service": "alethe-control",
+        "protocol": "1",
+        "authenticated": true,
+        "read_only": false,
+        "public_endpoints": [
+            { "method": "GET", "path": "/control/v1/health" },
+            { "method": "GET", "path": "/control/v1/version" },
+            { "method": "GET", "path": "/control/v1/capabilities" },
+            { "method": "POST", "path": "/control/v1/pairing/start" },
+            { "method": "POST", "path": "/control/v1/pairing/complete" }
+        ],
+        "authenticated_endpoints": [
+            { "method": "GET", "path": "/control/v1/runtime" },
+            { "method": "GET", "path": "/control/v1/agents" },
+            { "method": "POST", "path": "/control/v1/agents/spawn" },
+            { "method": "GET", "path": "/control/v1/agents/{id}" },
+            { "method": "POST", "path": "/control/v1/agents/{id}/send" },
+            { "method": "POST", "path": "/control/v1/agents/{id}/steer" },
+            { "method": "POST", "path": "/control/v1/agents/{id}/interrupt" },
+            { "method": "POST", "path": "/control/v1/agents/{id}/resume" },
+            { "method": "POST", "path": "/control/v1/agents/{id}/stop" },
+            { "method": "GET", "path": "/control/v1/agents/{id}/status" },
+            { "method": "GET", "path": "/control/v1/agents/{id}/output" },
+            { "method": "GET", "path": "/control/v1/projects" },
+            { "method": "GET", "path": "/control/v1/projects/{id}" },
+            { "method": "GET", "path": "/control/v1/targets" },
+            { "method": "GET", "path": "/control/v1/targets/{id}" },
+            { "method": "POST", "path": "/control/v1/terminals" },
+            { "method": "GET", "path": "/control/v1/terminals" },
+            { "method": "GET", "path": "/control/v1/terminals/{id}" },
+            { "method": "POST", "path": "/control/v1/terminals/{id}/input" },
+            { "method": "GET", "path": "/control/v1/terminals/{id}/scrollback" },
+            { "method": "POST", "path": "/control/v1/terminals/{id}/interrupt" },
+            { "method": "POST", "path": "/control/v1/terminals/{id}/restart" },
+            { "method": "DELETE", "path": "/control/v1/terminals/{id}" },
+            { "method": "GET", "path": "/control/v1/fs/list" },
+            { "method": "GET", "path": "/control/v1/fs/read" },
+            { "method": "PUT", "path": "/control/v1/fs/write" },
+            { "method": "POST", "path": "/control/v1/fs/mkdir" },
+            { "method": "POST", "path": "/control/v1/fs/move" },
+            { "method": "DELETE", "path": "/control/v1/fs" },
+            { "method": "GET", "path": "/control/v1/git/status" },
+            { "method": "GET", "path": "/control/v1/git/diff" },
+            { "method": "GET", "path": "/control/v1/git/log" },
+            { "method": "GET", "path": "/control/v1/git/branches" },
+            { "method": "GET", "path": "/control/v1/git/incoming-outgoing" },
+            { "method": "POST", "path": "/control/v1/git/init" },
+            { "method": "POST", "path": "/control/v1/git/stage" },
+            { "method": "POST", "path": "/control/v1/git/unstage" },
+            { "method": "POST", "path": "/control/v1/git/discard" },
+            { "method": "POST", "path": "/control/v1/git/commit" },
+            { "method": "POST", "path": "/control/v1/git/pull" },
+            { "method": "POST", "path": "/control/v1/git/push" },
+            { "method": "POST", "path": "/control/v1/git/branch" },
+            { "method": "POST", "path": "/control/v1/git/cherry-pick" },
+            { "method": "POST", "path": "/control/v1/git/revert" },
+            { "method": "POST", "path": "/control/v1/git/reset" },
+            { "method": "GET", "path": "/control/v1/worktrees" },
+            { "method": "POST", "path": "/control/v1/worktrees" },
+            { "method": "DELETE", "path": "/control/v1/worktrees/{agent}" },
+            { "method": "GET", "path": "/control/v1/worktrees/{agent}/changes" },
+            { "method": "POST", "path": "/control/v1/worktrees/{agent}/lock" },
+            { "method": "POST", "path": "/control/v1/worktrees/{agent}/unlock" },
+            { "method": "POST", "path": "/control/v1/worktrees/{agent}/fetch" },
+            { "method": "POST", "path": "/control/v1/worktrees/{agent}/commit" },
+            { "method": "POST", "path": "/control/v1/validation/run" },
+            { "method": "GET", "path": "/control/v1/events" },
+            { "method": "GET", "path": "/control/v1/auth/session" },
+            { "method": "POST", "path": "/control/v1/auth/rotate" },
+            { "method": "POST", "path": "/control/v1/auth/revoke" }
+        ]
+    })
+}
+
+fn runtime(port: u16) -> Value {
+    json!({
+        "service": "alethe-runtime",
+        "ready": true,
+        "pid": std::process::id(),
+        "port": port,
+        "cwd": std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH
+    })
+}
+
+fn probe_agent(id: &str, command: &str, execution_supported: bool) -> Value {
+    let path = crate::cli_resolver::find_windows_cli_launcher(command);
+    let Some(path) = path else {
+        return json!({ "id": id, "command": command, "available": false, "execution_supported": false, "status": "unavailable" });
+    };
+    let version = Command::new(&path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&output.stderr).lines())
+                .find(|line| !line.trim().is_empty())
+                .map(|line| line.trim().chars().take(256).collect::<String>())
+        });
+    json!({
+        "id": id,
+        "command": command,
+        "path": path,
+        "available": true,
+        "execution_supported": execution_supported,
+        "status": if execution_supported { "available" } else { "discovered" },
+        "version": version
+    })
+}
+
+fn agents() -> Value {
+    let entries = [
+        ("shell", "pwsh.exe", true),
+        ("codex", "codex", true),
+        ("claude", "claude", true),
+        ("opencode", "opencode", true),
+        ("antigravity", "antigravity", false),
+        ("cursor", "cursor", false),
+        ("copilot", "github-copilot", false),
+        ("mimo", "mimo", false),
+        ("freebuff", "freebuff", false),
+    ];
+    json!({ "agents": entries.into_iter().map(|(id, command, supported)| probe_agent(id, command, supported)).collect::<Vec<_>>() })
+}
+
+fn projects_payload(app: &AppHandle) -> Result<Value, String> {
+    let content = crate::projects::load_projects(app.clone())?
+        .ok_or_else(|| "projects_not_initialized".to_string())?;
+    let data = serde_json::from_str::<Value>(&content)
+        .map_err(|error| format!("projects_json_invalid:{error}"))?;
+    Ok(json!({ "data": data, "source": "Alethe projects.json" }))
+}
+
+fn project_from_payload(payload: &Value, id: &str) -> Option<Value> {
+    payload
+        .get("projects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(payload.as_array().into_iter().flatten())
+        .find(|project| {
+            ["id", "project_id", "name", "path", "cwd"]
+                .iter()
+                .filter_map(|field| project.get(*field).and_then(Value::as_str))
+                .any(|value| value == id)
+        })
+        .cloned()
+}
+
+fn terminal_snapshots(app: &AppHandle) -> Result<Vec<Value>, String> {
+    let sessions = app.state::<crate::pty::PtySessions>();
+    tauri::async_runtime::block_on(crate::pty::list_pty_processes(sessions))?
+        .into_iter()
+        .map(|snapshot| serde_json::to_value(snapshot).map_err(|error| error.to_string()))
+        .collect()
+}
+
+fn terminal_by_id(app: &AppHandle, id: &str) -> Result<Option<Value>, String> {
+    Ok(terminal_snapshots(app)?.into_iter().find(|snapshot| {
+        snapshot.get("id").and_then(Value::as_str) == Some(id)
+    }))
+}
+
+fn terminal_start(app: &AppHandle, input: TerminalStartInput) -> Result<Value, String> {
+    let sessions = app.state::<crate::pty::PtySessions>();
+    let remote = app.state::<std::sync::Arc<crate::remote::RemoteHub>>();
+    let response = tauri::async_runtime::block_on(crate::pty::spawn_pty(
+        app.clone(),
+        sessions,
+        remote,
+        input.cols.unwrap_or(120),
+        input.rows.unwrap_or(32),
+        input.id,
+        input.command,
+        input.cwd,
+        input.extra_args,
+        input.launcher_override,
+        input.env,
+    ))?;
+    serde_json::to_value(response).map_err(|error| error.to_string())
+}
+
+fn terminal_write(app: &AppHandle, id: String, data: String) -> Result<(), String> {
+    let sessions = app.state::<crate::pty::PtySessions>();
+    tauri::async_runtime::block_on(crate::pty::write_pty(sessions, id, data))
+}
+
+fn terminal_scrollback(app: &AppHandle, id: String, max_bytes: Option<usize>) -> Result<String, String> {
+    let sessions = app.state::<crate::pty::PtySessions>();
+    tauri::async_runtime::block_on(crate::pty::attach_pty(app.clone(), sessions, id, max_bytes))
+}
+
+fn terminal_kill(app: &AppHandle, id: String) -> Result<(), String> {
+    let sessions = app.state::<crate::pty::PtySessions>();
+    tauri::async_runtime::block_on(crate::pty::kill_pty(app.clone(), sessions, id))
+}
+
+fn terminal_restart(app: &AppHandle, id: String, input: TerminalStartInput) -> Result<Value, String> {
+    let sessions = app.state::<crate::pty::PtySessions>();
+    let remote = app.state::<std::sync::Arc<crate::remote::RemoteHub>>();
+    let response = tauri::async_runtime::block_on(crate::pty::restart_pty(
+        app.clone(), sessions, remote, id, input.command, input.cwd, input.extra_args,
+        input.launcher_override, input.env,
+    ))?;
+    serde_json::to_value(response).map_err(|error| error.to_string())
+}
+
+fn valid_runtime_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 || value.contains(['/', '\\', '?', '#']) {
+        return Err("agent_id_invalid".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn agent_spawn(app: &AppHandle, input: AgentSpawnInput) -> Result<Value, String> {
+    let agent = input.agent.trim().to_lowercase();
+    if !matches!(agent.as_str(), "shell" | "claude" | "codex" | "opencode") {
+        return Err(format!("agent_runtime_not_supported:{agent}"));
+    }
+    let id = valid_runtime_id(&input.id.unwrap_or_else(|| format!("agent-{}", nanoid::nanoid!(12))))?;
+    let terminal = terminal_start(app, TerminalStartInput {
+        cols: input.cols,
+        rows: input.rows,
+        id: Some(id.clone()),
+        command: Some(agent.clone()),
+        cwd: input.cwd,
+        extra_args: input.extra_args,
+        launcher_override: input.launcher_override,
+        env: input.env,
+    })?;
+    if let Some(task) = input.task.filter(|value| !value.trim().is_empty()) {
+        terminal_write(app, id.clone(), format!("{task}\r\n"))?;
+    }
+    let payload = json!({ "agent_id": id, "agent": agent, "terminal": terminal, "status": "started", "source": "real Alethe PTY" });
+    publish_event("agent.started", &payload);
+    Ok(payload)
+}
+
+fn agent_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    if method == "POST" && path == "/control/v1/agents/spawn" {
+        return Some(match read_json::<AgentSpawnInput>(request).and_then(|input| agent_spawn(app, input)) {
+            Ok(payload) => json_response(201, payload),
+            Err(error) if error.starts_with("agent_runtime_not_supported") => error_response(422, &error),
+            Err(error) => error_response(400, &error),
+        });
+    }
+    let suffix = path.strip_prefix("/control/v1/agents/")?;
+    let mut segments = suffix.split('/');
+    let id = valid_runtime_id(segments.next().unwrap_or_default()).ok()?;
+    let action = segments.next();
+    if segments.next().is_some() {
+        return Some(error_response(404, "control_route_not_found"));
+    }
+    match (method, action) {
+        ("GET", None) | ("GET", Some("status")) => Some(match terminal_by_id(app, &id) {
+            Ok(Some(status)) => json_response(200, json!({ "agent_id": id, "status": status, "source": "active Alethe PTY" })),
+            Ok(None) => error_response(404, "agent_not_found"),
+            Err(error) => error_response(500, &error),
+        }),
+        ("GET", Some("output")) => Some(match terminal_scrollback(app, id.clone(), query_parameter(url, "max_bytes").and_then(|v| v.parse().ok())) {
+            Ok(output) => json_response(200, json!({ "agent_id": id, "output": output })),
+            Err(error) => error_response(404, &error),
+        }),
+        ("POST", Some("send")) | ("POST", Some("steer")) => Some(match read_json::<AgentMessageInput>(request).and_then(|input| {
+            let message = input.message.or(input.data).filter(|value| !value.is_empty()).ok_or_else(|| "agent_message_required".to_string())?;
+            terminal_write(app, id.clone(), message)?;
+            Ok::<Value, String>(json!({ "agent_id": id, "accepted": true }))
+        }) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => error_response(400, &error),
+        }),
+        ("POST", Some("interrupt")) => Some(match terminal_write(app, id, "\u{3}".to_string()) {
+            Ok(()) => json_response(200, json!({ "accepted": true, "signal": "SIGINT" })),
+            Err(error) => error_response(404, &error),
+        }),
+        ("POST", Some("stop")) => Some(match terminal_kill(app, id) {
+            Ok(()) => json_response(200, json!({ "stopped": true })),
+            Err(error) => error_response(404, &error),
+        }),
+        ("POST", Some("resume")) => Some(error_response(409, "resume_requires_persisted_agent_session")),
+        _ => Some(error_response(404, "control_route_not_found")),
+    }
+}
+
+fn filesystem_route(method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    match (method, path) {
+        ("GET", "/control/v1/fs/list") => Some(match query_parameter(url, "path").ok_or_else(|| "path_required".to_string()).and_then(crate::filesystem::list_directory) {
+            Ok(entries) => json_response(200, json!({ "entries": entries })),
+            Err(error) => error_response(400, &error),
+        }),
+        ("GET", "/control/v1/fs/read") => Some(match query_parameter(url, "path").ok_or_else(|| "path_required".to_string()).and_then(crate::filesystem::read_text_file) {
+            Ok(content) => json_response(200, json!({ "content": content })),
+            Err(error) => error_response(400, &error),
+        }),
+        ("PUT", "/control/v1/fs/write") => Some(match read_json::<FilesystemWriteInput>(request).and_then(|input| {
+            let path = std::path::PathBuf::from(input.path.trim());
+            if path.as_os_str().is_empty() {
+                return Err("path_required".to_string());
+            }
+            if !path.parent().is_some_and(|parent| parent.is_dir()) {
+                return Err("parent_directory_not_found".to_string());
+            }
+            std::fs::write(path, input.content).map_err(|error| error.to_string())
+        }) {
+            Ok(()) => json_response(200, json!({ "written": true })),
+            Err(error) => error_response(400, &error),
+        }),
+        ("POST", "/control/v1/fs/mkdir") => Some(match read_json::<FilesystemPathInput>(request).and_then(|input| std::fs::create_dir_all(input.path).map_err(|error| error.to_string())) {
+            Ok(()) => json_response(201, json!({ "created": true })),
+            Err(error) => error_response(400, &error),
+        }),
+        ("POST", "/control/v1/fs/move") => Some(match read_json::<FilesystemMoveInput>(request).and_then(|input| std::fs::rename(input.path, input.destination).map_err(|error| error.to_string())) {
+            Ok(()) => json_response(200, json!({ "moved": true })),
+            Err(error) => error_response(400, &error),
+        }),
+        ("DELETE", "/control/v1/fs") => Some(match read_json::<FilesystemPathInput>(request).or_else(|_| query_parameter(url, "path").map(|path| FilesystemPathInput { path }).ok_or_else(|| "path_required".to_string())).and_then(|input| crate::filesystem::delete_filesystem_entry(input.path)) {
+            Ok(()) => json_response(200, json!({ "deleted": true })),
+            Err(error) => error_response(400, &error),
+        }),
+        _ => None,
+    }
+}
+
+fn git_route(method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    if method == "GET" {
+        let repo = query_parameter(url, "repo")?;
+        return match path {
+            "/control/v1/git/status" => Some(match tauri::async_runtime::block_on(crate::git_control::git_status(repo)) {
+                Ok(status) => json_response(200, json!({ "status": status })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/diff" => Some(match crate::git_control::git_diff(repo, query_parameter(url, "path").unwrap_or_default(), query_parameter(url, "staged").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))) {
+                Ok(diff) => json_response(200, json!({ "diff": diff })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/log" => Some(match tauri::async_runtime::block_on(crate::git_control::git_log_graph(repo, query_parameter(url, "max_count").and_then(|v| v.parse().ok()).unwrap_or(50).min(500))) {
+                Ok(commits) => json_response(200, json!({ "commits": commits })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/branches" => Some(match tauri::async_runtime::block_on(crate::git_control::git_list_branches(repo)) {
+                Ok(branches) => json_response(200, json!({ "branches": branches })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/incoming-outgoing" => Some(match tauri::async_runtime::block_on(crate::git_control::git_incoming_outgoing(repo)) {
+                Ok(value) => json_response(200, json!({ "incoming_outgoing": value })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/worktrees" => Some(match tauri::async_runtime::block_on(crate::worktrees::worktree_list(repo)) {
+                Ok(worktrees) => json_response(200, json!({ "worktrees": worktrees })),
+                Err(error) => error_response(400, &error),
+            }),
+            path if path.starts_with("/control/v1/worktrees/") && path.ends_with("/changes") => {
+                let id = path.trim_start_matches("/control/v1/worktrees/").trim_end_matches("/changes").trim_end_matches('/');
+                Some(match tauri::async_runtime::block_on(crate::worktrees::worktree_pending_changes(repo, id.to_string())) {
+                    Ok(changes) => json_response(200, json!({ "changes": changes })),
+                    Err(error) => error_response(400, &error),
+                })
+            }
+            _ => None,
+        };
+    }
+    if method == "POST" {
+        return match path {
+            "/control/v1/git/init" => Some(match read_json::<GitInitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_init(input.path))) {
+                Ok(repo_root) => json_response(201, json!({ "repo_root": repo_root })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/stage" => Some(match read_json::<GitPathsInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_stage(input.repo_root, input.paths))) {
+                Ok(()) => json_response(200, json!({ "staged": true })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/unstage" => Some(match read_json::<GitPathsInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_unstage(input.repo_root, input.paths))) {
+                Ok(()) => json_response(200, json!({ "unstaged": true })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/discard" => Some(match read_json::<GitDiscardInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_discard(input.repo_root, input.paths, input.untracked))) {
+                Ok(()) => json_response(200, json!({ "discarded": true })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/commit" => Some(match read_json::<GitCommitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_commit(input.repo_root, input.message))) {
+                Ok(output) => json_response(200, json!({ "committed": true, "output": output })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/pull" => Some(match read_json::<GitInitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_pull(input.path))) {
+                Ok(output) => json_response(200, json!({ "pulled": true, "output": output })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/push" => Some(match read_json::<GitInitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_push(input.path))) {
+                Ok(output) => json_response(200, json!({ "pushed": true, "output": output })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/branch" => Some(match read_json::<GitBranchInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_create_branch_from_commit(input.repo, input.hash, input.branch_name))) {
+                Ok(()) => json_response(201, json!({ "created": true })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/cherry-pick" => Some(match read_json::<GitHashInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_cherry_pick_commit(input.repo, input.hash))) {
+                Ok(output) => json_response(200, json!({ "cherry_picked": true, "output": output })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/revert" => Some(match read_json::<GitHashInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_revert_commit(input.repo, input.hash))) {
+                Ok(output) => json_response(200, json!({ "reverted": true, "output": output })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/git/reset" => Some(match read_json::<GitResetInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::git_control::git_reset_to_commit(input.repo, input.hash, input.mode))) {
+                Ok(()) => json_response(200, json!({ "reset": true })),
+                Err(error) => error_response(400, &error),
+            }),
+            "/control/v1/worktrees" => Some(match read_json::<WorktreeProvisionInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_provision(input.repo, input.agent_id, input.mode))) {
+                Ok(worktree) => json_response(201, json!({ "worktree": worktree })),
+                Err(error) => error_response(400, &error),
+            }),
+            path if path.starts_with("/control/v1/worktrees/") && path.ends_with("/lock") => {
+                Some(match read_json::<WorktreeLockInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_lock(input.repo, input.agent_id, input.reason))) {
+                    Ok(()) => json_response(200, json!({ "locked": true })),
+                    Err(error) => error_response(400, &error),
+                })
+            }
+            path if path.starts_with("/control/v1/worktrees/") && path.ends_with("/unlock") => {
+                Some(match read_json::<WorktreeAgentInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_unlock(input.repo, input.agent_id))) {
+                    Ok(()) => json_response(200, json!({ "unlocked": true })),
+                    Err(error) => error_response(400, &error),
+                })
+            }
+            path if path.starts_with("/control/v1/worktrees/") && path.ends_with("/fetch") => {
+                Some(match read_json::<WorktreeAgentInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_fetch_branch(input.repo, input.agent_id))) {
+                    Ok(()) => json_response(200, json!({ "fetched": true })),
+                    Err(error) => error_response(400, &error),
+                })
+            }
+            path if path.starts_with("/control/v1/worktrees/") && path.ends_with("/commit") => {
+                Some(match read_json::<WorktreeCommitInput>(request).and_then(|input| tauri::async_runtime::block_on(crate::worktrees::worktree_commit_worktree(input.repo, input.agent_id, input.message))) {
+                    Ok(committed) => json_response(200, json!({ "committed": committed })),
+                    Err(error) => error_response(400, &error),
+                })
+            }
+            _ => None,
+        };
+    }
+    if method == "DELETE" && path.starts_with("/control/v1/worktrees/") {
+        let agent_id = path.trim_start_matches("/control/v1/worktrees/");
+        let Some(repo) = query_parameter(url, "repo") else { return Some(error_response(400, "repo_required")); };
+        let force = query_parameter(url, "force").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        return Some(match tauri::async_runtime::block_on(crate::worktrees::worktree_remove(repo, agent_id.to_string(), force)) {
+            Ok(()) => json_response(200, json!({ "deleted": true })),
+            Err(error) => error_response(400, &error),
+        });
+    }
+    None
+}
+
+fn validation_route(method: &str, path: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    if method != "POST" || path != "/control/v1/validation/run" {
+        return None;
+    }
+    Some(match read_json::<ValidationInput>(request).and_then(|input| crate::validation::run_validation(input.cwd, input.commands)) {
+        Ok(validation) => json_response(200, json!({ "validation": validation })),
+        Err(error) => error_response(400, &error),
+    })
+}
+
+fn bearer_token(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| {
+            header
+                .field
+                .as_str()
+                .to_string()
+                .eq_ignore_ascii_case("Authorization")
+        })
+        .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn unauthorized_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    error_response(401, "authentication_required")
+        .with_header(Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header"))
+}
+
+pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16) -> bool {
+    if !is_control_path(url) {
+        return false;
+    }
+    let method = request.method().to_string();
+    let path = endpoint_path(url);
+    if method == "GET" && path == "/control/v1/events" {
+        let Some(token) = bearer_token(&request) else { let _ = request.respond(unauthorized_response()); return true; };
+        if state().authenticate(token).is_err() { let _ = request.respond(unauthorized_response()); return true; }
+        let receiver = subscribe_events();
+        let writer = request.into_writer();
+        std::thread::spawn(move || stream_events(writer, receiver));
+        return true;
+    }
+
+    match (method.as_str(), path) {
+        ("GET", "/control/v1/health") => { let _ = request.respond(json_response(200, health(port))); return true; }
+        ("GET", "/control/v1/version") => { let _ = request.respond(json_response(200, version())); return true; }
+        ("GET", "/control/v1/capabilities") => { let _ = request.respond(json_response(200, capabilities())); return true; }
+        ("POST", "/control/v1/pairing/start") => {
+            let response = match read_json::<PairingStartInput>(&mut request).and_then(|input| state().start_pairing(input.client_id)) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => error_response(400, &error),
+            };
+            let _ = request.respond(response);
+            return true;
+        }
+        ("POST", "/control/v1/pairing/complete") => {
+            let response = match read_json::<PairingCompleteInput>(&mut request).and_then(|input| state().complete_pairing(input)) {
+                Ok(payload) => json_response(200, payload),
+                Err(error) => error_response(if error.starts_with("credential_") { 503 } else { 400 }, &error),
+            };
+            let _ = request.respond(response);
+            return true;
+        }
+        _ => {}
+    }
+
+    let Some(token) = bearer_token(&request) else { let _ = request.respond(unauthorized_response()); return true; };
+    if state().authenticate(token).is_err() { let _ = request.respond(unauthorized_response()); return true; }
+
+    let response = if path == "/control/v1/runtime" && method == "GET" {
+        json_response(200, runtime(port))
+    } else if path == "/control/v1/agents" && method == "GET" {
+        json_response(200, agents())
+    } else if path.starts_with("/control/v1/agents/") {
+        agent_route(&app, &method, path, url, &mut request).unwrap_or_else(|| error_response(404, "control_route_not_found"))
+    } else if path.starts_with("/control/v1/fs/") || path == "/control/v1/fs" {
+        filesystem_route(&method, path, url, &mut request).unwrap_or_else(|| error_response(404, "control_route_not_found"))
+    } else if path.starts_with("/control/v1/git/") || path == "/control/v1/worktrees" || path.starts_with("/control/v1/worktrees/") {
+        git_route(&method, path, url, &mut request).unwrap_or_else(|| error_response(404, "control_route_not_found"))
+    } else if path.starts_with("/control/v1/validation/") {
+        validation_route(&method, path, &mut request).unwrap_or_else(|| error_response(404, "control_route_not_found"))
+    } else if path == "/control/v1/projects" && method == "GET" {
+        match projects_payload(&app) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) if error == "projects_not_initialized" => json_response(200, json!({ "data": null, "source": "Alethe projects.json" })),
+            Err(error) => error_response(500, &error),
+        }
+    } else if path.starts_with("/control/v1/projects/") && method == "GET" {
+        match projects_payload(&app) {
+            Ok(payload) => match project_from_payload(&payload["data"], path.trim_start_matches("/control/v1/projects/")) {
+                Some(project) => json_response(200, json!({ "project": project })),
+                None => error_response(404, "project_not_found"),
+            },
+            Err(error) => error_response(500, &error),
+        }
+    } else if path == "/control/v1/targets" && method == "GET" {
+        match terminal_snapshots(&app) {
+            Ok(targets) => json_response(200, json!({ "targets": targets, "source": "active Alethe PTY sessions" })),
+            Err(error) => error_response(500, &error),
+        }
+    } else if path.starts_with("/control/v1/targets/") && method == "GET" {
+        match terminal_by_id(&app, path.trim_start_matches("/control/v1/targets/")) {
+            Ok(Some(target)) => json_response(200, json!({ "target": target })),
+            Ok(None) => error_response(404, "target_not_found"),
+            Err(error) => error_response(500, &error),
+        }
+    } else if path == "/control/v1/terminals" && method == "POST" {
+        match read_json::<TerminalStartInput>(&mut request).and_then(|input| terminal_start(&app, input)) {
+            Ok(payload) => json_response(201, payload),
+            Err(error) => error_response(400, &error),
+        }
+    } else if path == "/control/v1/terminals" && method == "GET" {
+        match terminal_snapshots(&app) {
+            Ok(terminals) => json_response(200, json!({ "terminals": terminals })),
+            Err(error) => error_response(500, &error),
+        }
+    } else if path.starts_with("/control/v1/terminals/") {
+        terminal_route(&app, &method, path, url, &mut request)
+            .unwrap_or_else(|| error_response(404, "control_route_not_found"))
+    } else if path == "/control/v1/auth/session" && method == "GET" {
+        match state().authenticate(token) {
+            Ok(session) => json_response(200, json!({ "authenticated": true, "client_id": session.client_id, "created_at": session.created_at, "expires_at": session.expires_at })),
+            Err(_) => unauthorized_response(),
+        }
+    } else if path == "/control/v1/auth/rotate" && method == "POST" {
+        match state().rotate(token) {
+            Ok(payload) => json_response(200, payload),
+            Err(_) => unauthorized_response(),
+        }
+    } else if path == "/control/v1/auth/revoke" && method == "POST" {
+        match state().revoke(token) {
+            Ok(payload) => json_response(200, payload),
+            Err(_) => unauthorized_response(),
+        }
+    } else if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE") {
+        error_response(405, "method_not_allowed")
+    } else {
+        error_response(404, "control_route_not_found")
+    };
+    let _ = request.respond(response);
+    true
+}
+
+fn terminal_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    let suffix = path.strip_prefix("/control/v1/terminals/")?;
+    let mut segments = suffix.split('/');
+    let id = segments.next()?.to_string();
+    let action = segments.next();
+    if segments.next().is_some() || id.is_empty() {
+        return Some(error_response(404, "terminal_not_found"));
+    }
+    match (method, action) {
+        ("GET", None) => Some(match terminal_by_id(app, &id) {
+            Ok(Some(terminal)) => json_response(200, json!({ "terminal": terminal })),
+            Ok(None) => error_response(404, "terminal_not_found"),
+            Err(error) => error_response(500, &error),
+        }),
+        ("POST", Some("input")) => Some(match read_json::<TerminalInput>(request).and_then(|input| terminal_write(app, id, input.data)) {
+            Ok(()) => json_response(200, json!({ "accepted": true })),
+            Err(error) => error_response(400, &error),
+        }),
+        ("GET", Some("scrollback")) => Some(match terminal_scrollback(app, id.clone(), query_parameter(url, "max_bytes").and_then(|v| v.parse().ok())) {
+            Ok(output) => json_response(200, json!({ "terminal_id": id, "output": output })),
+            Err(error) => error_response(404, &error),
+        }),
+        ("POST", Some("interrupt")) => Some(match terminal_write(app, id, "\u{3}".to_string()) {
+            Ok(()) => json_response(200, json!({ "accepted": true, "signal": "SIGINT" })),
+            Err(error) => error_response(404, &error),
+        }),
+        ("POST", Some("restart")) => Some(match read_json::<TerminalStartInput>(request).and_then(|input| terminal_restart(app, id, input)) {
+            Ok(payload) => json_response(200, payload),
+            Err(error) => error_response(400, &error),
+        }),
+        ("DELETE", None) => Some(match terminal_kill(app, id) {
+            Ok(()) => json_response(200, json!({ "deleted": true })),
+            Err(error) => error_response(404, &error),
+        }),
+        _ => Some(error_response(404, "control_route_not_found")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_contract_is_loopback_and_ready() {
+        let payload = health(9123);
+        assert_eq!(payload["service"], "alethe-control");
+        assert_eq!(payload["ready"], true);
+        assert_eq!(payload["bind"], "127.0.0.1");
+        assert_eq!(payload["port"], 9123);
+    }
+
+    #[test]
+    fn control_path_requires_v1() {
+        assert!(is_control_path("/control/v1/health?x=1"));
+        assert!(!is_control_path("/control/v123/health"));
+        assert!(!is_control_path("/api/control/v1/health"));
+    }
+
+    #[test]
+    fn client_ids_are_bounded() {
+        assert_eq!(valid_client_id(" transcripts ").unwrap(), "transcripts");
+        assert_eq!(valid_client_id(" ").unwrap_err(), "client_id_required");
+        assert_eq!(valid_client_id(&"x".repeat(129)).unwrap_err(), "client_id_too_long");
+    }
+
+    #[test]
+    fn token_comparison_is_exact() {
+        assert!(constant_time_equal("abc", "abc"));
+        assert!(!constant_time_equal("abc", "abd"));
+        assert!(!constant_time_equal("abc", "abcd"));
+    }
+
+    #[test]
+    fn capabilities_contain_only_control_plane_routes() {
+        let payload = capabilities();
+        assert_eq!(payload["authenticated"], true);
+        assert!(payload["authenticated_endpoints"].as_array().is_some_and(|items| items.len() >= 50));
+    }
+
+    #[test]
+    fn sse_frame_is_parseable() {
+        let frame = sse_frame("agent-hook", &json!({ "agent": "codex" }));
+        assert!(frame.starts_with("event: agent-hook\ndata: "));
+        assert!(frame.ends_with("\n\n"));
+        assert!(frame.contains("\"agent\":\"codex\""));
+    }
+}
