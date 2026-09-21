@@ -1,0 +1,1348 @@
+{
+  "generatedAt": "2026-09-21T01:28:04.351Z",
+  "counts": {
+    "declared": 265,
+    "registered": 257,
+    "registeredButNotDeclared": 0,
+    "declaredButNotRegistered": 0
+  },
+  "registeredButNotDeclared": [],
+  "declaredButNotRegistered": [
+    "ghostty_set_focus (src-tauri/src/ghostty_bridge.rs:1044)",
+    "ghostty_surface_exited (src-tauri/src/ghostty_bridge.rs:1053)",
+    "set_window_opacity (src-tauri/src/lib.rs:87)",
+    "set_window_opacity (src-tauri/src/lib.rs:109)",
+    "quit_app (src-tauri/src/lib.rs:526)",
+    "ping (src-tauri/src/lib.rs:535)",
+    "save_project_plan (src-tauri/src/planning.rs:431)",
+    "patch_project_plan (src-tauri/src/planning.rs:479)",
+    "append_plan_diagram (src-tauri/src/planning.rs:523)"
+  ],
+  "declared": [
+    {
+      "name": "record_activity_samples",
+      "file": "src-tauri/src/activity_stats.rs",
+      "line": 242
+    },
+    {
+      "name": "get_activity_summary",
+      "file": "src-tauri/src/activity_stats.rs",
+      "line": 258
+    },
+    {
+      "name": "clear_activity_stats",
+      "file": "src-tauri/src/activity_stats.rs",
+      "line": 292
+    },
+    {
+      "name": "get_session_cost",
+      "file": "src-tauri/src/agent_cost.rs",
+      "line": 238
+    },
+    {
+      "name": "get_transcript_cost",
+      "file": "src-tauri/src/agent_cost.rs",
+      "line": 340
+    },
+    {
+      "name": "get_model_pricing",
+      "file": "src-tauri/src/agent_cost.rs",
+      "line": 408
+    },
+    {
+      "name": "get_opencode_usage_summary",
+      "file": "src-tauri/src/agent_cost.rs",
+      "line": 434
+    },
+    {
+      "name": "agent_hooks_endpoint",
+      "file": "src-tauri/src/agent_events.rs",
+      "line": 56
+    },
+    {
+      "name": "agent_hooks_token",
+      "file": "src-tauri/src/agent_events.rs",
+      "line": 63
+    },
+    {
+      "name": "agent_hooks_settings_path",
+      "file": "src-tauri/src/agent_events.rs",
+      "line": 68
+    },
+    {
+      "name": "list_installed_agents",
+      "file": "src-tauri/src/agent_library.rs",
+      "line": 23
+    },
+    {
+      "name": "install_agent",
+      "file": "src-tauri/src/agent_library.rs",
+      "line": 54
+    },
+    {
+      "name": "uninstall_agent",
+      "file": "src-tauri/src/agent_library.rs",
+      "line": 83
+    },
+    {
+      "name": "ai_memory_detect",
+      "file": "src-tauri/src/ai_memory.rs",
+      "line": 56
+    },
+    {
+      "name": "ai_memory_mcp_config_path",
+      "file": "src-tauri/src/ai_memory.rs",
+      "line": 89
+    },
+    {
+      "name": "ai_memory_opencode_config_write",
+      "file": "src-tauri/src/ai_memory.rs",
+      "line": 107
+    },
+    {
+      "name": "ai_memory_codex_config_write",
+      "file": "src-tauri/src/ai_memory.rs",
+      "line": 153
+    },
+    {
+      "name": "snapshot_antigravity_sessions",
+      "file": "src-tauri/src/antigravity_sessions.rs",
+      "line": 84
+    },
+    {
+      "name": "get_antigravity_usage",
+      "file": "src-tauri/src/antigravity_usage.rs",
+      "line": 239
+    },
+    {
+      "name": "export_backup",
+      "file": "src-tauri/src/backup.rs",
+      "line": 16
+    },
+    {
+      "name": "export_profile_backup",
+      "file": "src-tauri/src/backup.rs",
+      "line": 24
+    },
+    {
+      "name": "import_backup",
+      "file": "src-tauri/src/backup.rs",
+      "line": 120
+    },
+    {
+      "name": "browser_pane_open",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 340
+    },
+    {
+      "name": "browser_pane_close",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 397
+    },
+    {
+      "name": "browser_pane_observe",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 431
+    },
+    {
+      "name": "browser_pane_targets",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 441
+    },
+    {
+      "name": "browser_pane_close_target",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 452
+    },
+    {
+      "name": "browser_pane_watch",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 472
+    },
+    {
+      "name": "browser_pane_navigate",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 527
+    },
+    {
+      "name": "browser_pane_reload",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 546
+    },
+    {
+      "name": "browser_pane_history",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 567
+    },
+    {
+      "name": "browser_pane_resize",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 607
+    },
+    {
+      "name": "browser_pane_set_streaming",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 639
+    },
+    {
+      "name": "browser_pane_mouse",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 666
+    },
+    {
+      "name": "browser_pane_key",
+      "file": "src-tauri/src/browser_pane.rs",
+      "line": 682
+    },
+    {
+      "name": "browser_session_start",
+      "file": "src-tauri/src/browser_session.rs",
+      "line": 179
+    },
+    {
+      "name": "browser_session_stop",
+      "file": "src-tauri/src/browser_session.rs",
+      "line": 287
+    },
+    {
+      "name": "browser_session_status",
+      "file": "src-tauri/src/browser_session.rs",
+      "line": 295
+    },
+    {
+      "name": "playwright_mcp_config_path",
+      "file": "src-tauri/src/browser_session.rs",
+      "line": 327
+    },
+    {
+      "name": "snapshot_claude_sessions",
+      "file": "src-tauri/src/claude_sessions.rs",
+      "line": 224
+    },
+    {
+      "name": "list_claude_sessions",
+      "file": "src-tauri/src/claude_sessions.rs",
+      "line": 271
+    },
+    {
+      "name": "get_claude_session_title",
+      "file": "src-tauri/src/claude_sessions.rs",
+      "line": 344
+    },
+    {
+      "name": "get_claude_activity",
+      "file": "src-tauri/src/claude_sessions.rs",
+      "line": 387
+    },
+    {
+      "name": "get_multi_agent_activity",
+      "file": "src-tauri/src/claude_sessions.rs",
+      "line": 476
+    },
+    {
+      "name": "get_claude_usage",
+      "file": "src-tauri/src/claude_usage.rs",
+      "line": 105
+    },
+    {
+      "name": "cli_take_pending_open",
+      "file": "src-tauri/src/cli_launch.rs",
+      "line": 101
+    },
+    {
+      "name": "find_cli_launcher",
+      "file": "src-tauri/src/cli_resolver.rs",
+      "line": 133
+    },
+    {
+      "name": "agent_cli_version",
+      "file": "src-tauri/src/cli_resolver.rs",
+      "line": 265
+    },
+    {
+      "name": "probe_install_toolchain",
+      "file": "src-tauri/src/cli_resolver.rs",
+      "line": 298
+    },
+    {
+      "name": "refresh_cli_launcher",
+      "file": "src-tauri/src/cli_resolver.rs",
+      "line": 602
+    },
+    {
+      "name": "discover_provider_models",
+      "file": "src-tauri/src/cli_resolver.rs",
+      "line": 977
+    },
+    {
+      "name": "cli_shim_status",
+      "file": "src-tauri/src/cli_shim.rs",
+      "line": 228
+    },
+    {
+      "name": "cli_shim_install",
+      "file": "src-tauri/src/cli_shim.rs",
+      "line": 233
+    },
+    {
+      "name": "cli_shim_uninstall",
+      "file": "src-tauri/src/cli_shim.rs",
+      "line": 258
+    },
+    {
+      "name": "codex_app_server_start",
+      "file": "src-tauri/src/codex_app_server.rs",
+      "line": 60
+    },
+    {
+      "name": "codex_app_server_send",
+      "file": "src-tauri/src/codex_app_server.rs",
+      "line": 167
+    },
+    {
+      "name": "codex_app_server_stop",
+      "file": "src-tauri/src/codex_app_server.rs",
+      "line": 183
+    },
+    {
+      "name": "snapshot_codex_sessions",
+      "file": "src-tauri/src/codex_sessions.rs",
+      "line": 75
+    },
+    {
+      "name": "get_codex_usage",
+      "file": "src-tauri/src/codex_usage.rs",
+      "line": 161
+    },
+    {
+      "name": "merge_prepare",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 152
+    },
+    {
+      "name": "merge_finalize",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 264
+    },
+    {
+      "name": "merge_validate",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 375
+    },
+    {
+      "name": "merge_preflight_abort",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 632
+    },
+    {
+      "name": "merge_rebase_onto_target",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 668
+    },
+    {
+      "name": "merge_force_cleanup",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 767
+    },
+    {
+      "name": "merge_abort",
+      "file": "src-tauri/src/conflict_resolution.rs",
+      "line": 808
+    },
+    {
+      "name": "contract_check",
+      "file": "src-tauri/src/contract_check.rs",
+      "line": 244
+    },
+    {
+      "name": "get_last_crash_report",
+      "file": "src-tauri/src/crash_watch.rs",
+      "line": 149
+    },
+    {
+      "name": "get_job_guard_status",
+      "file": "src-tauri/src/crash_watch.rs",
+      "line": 154
+    },
+    {
+      "name": "create_cursor_chat",
+      "file": "src-tauri/src/cursor_sessions.rs",
+      "line": 37
+    },
+    {
+      "name": "open_in_file_explorer",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 22
+    },
+    {
+      "name": "open_in_vscode",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 62
+    },
+    {
+      "name": "open_in_browser",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 91
+    },
+    {
+      "name": "write_clipboard_text",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 123
+    },
+    {
+      "name": "read_clipboard_text",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 141
+    },
+    {
+      "name": "read_clipboard_payload",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 171
+    },
+    {
+      "name": "open_data_folder",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 665
+    },
+    {
+      "name": "open_spawn_log",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 680
+    },
+    {
+      "name": "reset_app_data",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 701
+    },
+    {
+      "name": "wipe_all_app_data",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 724
+    },
+    {
+      "name": "open_logs_folder",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 747
+    },
+    {
+      "name": "export_logs",
+      "file": "src-tauri/src/diagnostics.rs",
+      "line": 762
+    },
+    {
+      "name": "set_discord_presence",
+      "file": "src-tauri/src/discord_presence.rs",
+      "line": 94
+    },
+    {
+      "name": "clear_discord_presence",
+      "file": "src-tauri/src/discord_presence.rs",
+      "line": 111
+    },
+    {
+      "name": "economy_agents_enabled",
+      "file": "src-tauri/src/economy_agents.rs",
+      "line": 102
+    },
+    {
+      "name": "set_economy_agents",
+      "file": "src-tauri/src/economy_agents.rs",
+      "line": 108
+    },
+    {
+      "name": "publish_event",
+      "file": "src-tauri/src/event_bus.rs",
+      "line": 68
+    },
+    {
+      "name": "list_directory",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 42
+    },
+    {
+      "name": "browse_directory",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 138
+    },
+    {
+      "name": "rename_filesystem_entry",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 221
+    },
+    {
+      "name": "delete_filesystem_entry",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 243
+    },
+    {
+      "name": "read_text_file",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 256
+    },
+    {
+      "name": "write_text_file",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 265
+    },
+    {
+      "name": "write_project_marker",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 279
+    },
+    {
+      "name": "read_project_marker",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 294
+    },
+    {
+      "name": "ensure_todo_template",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 302
+    },
+    {
+      "name": "watch_file",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 326
+    },
+    {
+      "name": "unwatch_file",
+      "file": "src-tauri/src/filesystem.rs",
+      "line": 369
+    },
+    {
+      "name": "ghostty_spawn",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1013
+    },
+    {
+      "name": "ghostty_sync_frame",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1024
+    },
+    {
+      "name": "ghostty_set_hidden",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1035
+    },
+    {
+      "name": "ghostty_set_focus",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1044
+    },
+    {
+      "name": "ghostty_surface_exited",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1053
+    },
+    {
+      "name": "ghostty_kill",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1061
+    },
+    {
+      "name": "ghostty_kill_all",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1066
+    },
+    {
+      "name": "ghostty_debug_send_read",
+      "file": "src-tauri/src/ghostty_bridge.rs",
+      "line": 1071
+    },
+    {
+      "name": "github_pr_list_mine",
+      "file": "src-tauri/src/github_pr.rs",
+      "line": 152
+    },
+    {
+      "name": "github_pr_find",
+      "file": "src-tauri/src/github_pr.rs",
+      "line": 172
+    },
+    {
+      "name": "github_pr_merge",
+      "file": "src-tauri/src/github_pr.rs",
+      "line": 197
+    },
+    {
+      "name": "github_sync_status",
+      "file": "src-tauri/src/github_sync.rs",
+      "line": 184
+    },
+    {
+      "name": "github_sync_set_token",
+      "file": "src-tauri/src/github_sync.rs",
+      "line": 189
+    },
+    {
+      "name": "github_sync_logout",
+      "file": "src-tauri/src/github_sync.rs",
+      "line": 222
+    },
+    {
+      "name": "github_sync_push",
+      "file": "src-tauri/src/github_sync.rs",
+      "line": 232
+    },
+    {
+      "name": "github_sync_pull",
+      "file": "src-tauri/src/github_sync.rs",
+      "line": 272
+    },
+    {
+      "name": "git_diff",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 457
+    },
+    {
+      "name": "git_init",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 476
+    },
+    {
+      "name": "git_status",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 504
+    },
+    {
+      "name": "git_stage",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 516
+    },
+    {
+      "name": "git_unstage",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 536
+    },
+    {
+      "name": "git_discard",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 552
+    },
+    {
+      "name": "git_commit",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 573
+    },
+    {
+      "name": "git_push",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 620
+    },
+    {
+      "name": "git_list_branches",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 638
+    },
+    {
+      "name": "git_diff_summary",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 793
+    },
+    {
+      "name": "git_log_graph",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 937
+    },
+    {
+      "name": "git_show_commit_files",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1028
+    },
+    {
+      "name": "git_show_commit_message",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1049
+    },
+    {
+      "name": "git_create_branch_from_commit",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1068
+    },
+    {
+      "name": "git_cherry_pick_commit",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1088
+    },
+    {
+      "name": "git_revert_commit",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1102
+    },
+    {
+      "name": "git_reset_to_commit",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1125
+    },
+    {
+      "name": "git_incoming_outgoing",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1180
+    },
+    {
+      "name": "git_pull",
+      "file": "src-tauri/src/git_control.rs",
+      "line": 1193
+    },
+    {
+      "name": "graphify_ensure_graph",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 192
+    },
+    {
+      "name": "graphify_detect",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 224
+    },
+    {
+      "name": "graphify_mcp_config_path",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 247
+    },
+    {
+      "name": "graphify_opencode_config_write",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 311
+    },
+    {
+      "name": "graphify_codex_config_write",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 366
+    },
+    {
+      "name": "graphify_read_graph",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 477
+    },
+    {
+      "name": "graphify_snapshot",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 516
+    },
+    {
+      "name": "graphify_list_snapshots",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 561
+    },
+    {
+      "name": "graphify_diff_snapshot",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 638
+    },
+    {
+      "name": "graphify_rollback",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 670
+    },
+    {
+      "name": "graphify_prune_snapshots",
+      "file": "src-tauri/src/graphify.rs",
+      "line": 715
+    },
+    {
+      "name": "prepare_agent_handoff",
+      "file": "src-tauri/src/handoff.rs",
+      "line": 462
+    },
+    {
+      "name": "materialize_agent_handoff",
+      "file": "src-tauri/src/handoff.rs",
+      "line": 521
+    },
+    {
+      "name": "complete_agent_handoff",
+      "file": "src-tauri/src/handoff.rs",
+      "line": 553
+    },
+    {
+      "name": "health_probe",
+      "file": "src-tauri/src/health_probe.rs",
+      "line": 182
+    },
+    {
+      "name": "set_window_opacity",
+      "file": "src-tauri/src/lib.rs",
+      "line": 87
+    },
+    {
+      "name": "set_window_opacity",
+      "file": "src-tauri/src/lib.rs",
+      "line": 109
+    },
+    {
+      "name": "quit_app",
+      "file": "src-tauri/src/lib.rs",
+      "line": 526
+    },
+    {
+      "name": "ping",
+      "file": "src-tauri/src/lib.rs",
+      "line": 535
+    },
+    {
+      "name": "record_frontend_error",
+      "file": "src-tauri/src/logging.rs",
+      "line": 137
+    },
+    {
+      "name": "record_app_event",
+      "file": "src-tauri/src/logging.rs",
+      "line": 158
+    },
+    {
+      "name": "mcp_registry_search",
+      "file": "src-tauri/src/mcp_catalog.rs",
+      "line": 346
+    },
+    {
+      "name": "mcp_health_check",
+      "file": "src-tauri/src/mcp_health.rs",
+      "line": 160
+    },
+    {
+      "name": "mcp_scan",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 267
+    },
+    {
+      "name": "mcp_config_paths",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 278
+    },
+    {
+      "name": "mcp_capabilities",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 288
+    },
+    {
+      "name": "mcp_upsert",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 659
+    },
+    {
+      "name": "mcp_remove",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 685
+    },
+    {
+      "name": "mcp_set_enabled",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 703
+    },
+    {
+      "name": "mcp_sync",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 840
+    },
+    {
+      "name": "mcp_reveal_env",
+      "file": "src-tauri/src/mcp_store.rs",
+      "line": 896
+    },
+    {
+      "name": "merge_analyze",
+      "file": "src-tauri/src/merge_analyzer.rs",
+      "line": 186
+    },
+    {
+      "name": "gsd_opencode_plugin_write",
+      "file": "src-tauri/src/opencode_gsd_plugin.rs",
+      "line": 55
+    },
+    {
+      "name": "snapshot_opencode_sessions",
+      "file": "src-tauri/src/opencode_sessions.rs",
+      "line": 32
+    },
+    {
+      "name": "opencode_export_session",
+      "file": "src-tauri/src/opencode_sessions.rs",
+      "line": 102
+    },
+    {
+      "name": "orchestrator_mcp_config_path",
+      "file": "src-tauri/src/orchestrator.rs",
+      "line": 60
+    },
+    {
+      "name": "orchestrator_jobs",
+      "file": "src-tauri/src/orchestrator.rs",
+      "line": 80
+    },
+    {
+      "name": "orchestrator_set_concurrency",
+      "file": "src-tauri/src/orchestrator.rs",
+      "line": 85
+    },
+    {
+      "name": "start_gsd_watcher",
+      "file": "src-tauri/src/planning.rs",
+      "line": 14
+    },
+    {
+      "name": "stop_gsd_watcher",
+      "file": "src-tauri/src/planning.rs",
+      "line": 82
+    },
+    {
+      "name": "planning_audit_record",
+      "file": "src-tauri/src/planning.rs",
+      "line": 186
+    },
+    {
+      "name": "planning_audit_history",
+      "file": "src-tauri/src/planning.rs",
+      "line": 197
+    },
+    {
+      "name": "set_planning_autocommit",
+      "file": "src-tauri/src/planning.rs",
+      "line": 253
+    },
+    {
+      "name": "get_planning_autocommit",
+      "file": "src-tauri/src/planning.rs",
+      "line": 259
+    },
+    {
+      "name": "list_project_plans",
+      "file": "src-tauri/src/planning.rs",
+      "line": 328
+    },
+    {
+      "name": "save_project_plan",
+      "file": "src-tauri/src/planning.rs",
+      "line": 431
+    },
+    {
+      "name": "patch_project_plan",
+      "file": "src-tauri/src/planning.rs",
+      "line": 479
+    },
+    {
+      "name": "append_plan_diagram",
+      "file": "src-tauri/src/planning.rs",
+      "line": 523
+    },
+    {
+      "name": "read_planning_status",
+      "file": "src-tauri/src/planning_gate.rs",
+      "line": 162
+    },
+    {
+      "name": "read_gsd_child_session",
+      "file": "src-tauri/src/planning_gate.rs",
+      "line": 168
+    },
+    {
+      "name": "read_gsd_child_busy",
+      "file": "src-tauri/src/planning_gate.rs",
+      "line": 180
+    },
+    {
+      "name": "read_gsd_child_error",
+      "file": "src-tauri/src/planning_gate.rs",
+      "line": 186
+    },
+    {
+      "name": "read_gsd_child_state",
+      "file": "src-tauri/src/planning_gate.rs",
+      "line": 228
+    },
+    {
+      "name": "read_gsd_procedure",
+      "file": "src-tauri/src/planning_gate.rs",
+      "line": 235
+    },
+    {
+      "name": "plugins_list",
+      "file": "src-tauri/src/plugins.rs",
+      "line": 112
+    },
+    {
+      "name": "plugin_install",
+      "file": "src-tauri/src/plugins.rs",
+      "line": 125
+    },
+    {
+      "name": "plugin_uninstall",
+      "file": "src-tauri/src/plugins.rs",
+      "line": 137
+    },
+    {
+      "name": "get_pty_tree_info",
+      "file": "src-tauri/src/process_tree.rs",
+      "line": 271
+    },
+    {
+      "name": "kill_pty_tree_cmd",
+      "file": "src-tauri/src/process_tree.rs",
+      "line": 276
+    },
+    {
+      "name": "list_profiles",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 517
+    },
+    {
+      "name": "list_profile_summaries",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 522
+    },
+    {
+      "name": "get_active_profile",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 527
+    },
+    {
+      "name": "set_active_profile",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 532
+    },
+    {
+      "name": "create_profile",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 537
+    },
+    {
+      "name": "rename_profile",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 542
+    },
+    {
+      "name": "delete_profile",
+      "file": "src-tauri/src/profiles.rs",
+      "line": 551
+    },
+    {
+      "name": "load_projects",
+      "file": "src-tauri/src/projects.rs",
+      "line": 77
+    },
+    {
+      "name": "save_projects",
+      "file": "src-tauri/src/projects.rs",
+      "line": 90
+    },
+    {
+      "name": "clone_github_repo",
+      "file": "src-tauri/src/projects.rs",
+      "line": 187
+    },
+    {
+      "name": "detect_project_stack",
+      "file": "src-tauri/src/project_detector.rs",
+      "line": 73
+    },
+    {
+      "name": "pty_exists",
+      "file": "src-tauri/src/pty.rs",
+      "line": 222
+    },
+    {
+      "name": "spawn_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 230
+    },
+    {
+      "name": "restart_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 783
+    },
+    {
+      "name": "attach_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 835
+    },
+    {
+      "name": "clear_pty_scrollback",
+      "file": "src-tauri/src/pty.rs",
+      "line": 877
+    },
+    {
+      "name": "write_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 921
+    },
+    {
+      "name": "resize_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 952
+    },
+    {
+      "name": "kill_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1050
+    },
+    {
+      "name": "suspend_pty",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1144
+    },
+    {
+      "name": "get_pty_cwd",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1156
+    },
+    {
+      "name": "set_pty_read_state",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1183
+    },
+    {
+      "name": "set_pty_visible",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1204
+    },
+    {
+      "name": "set_pty_priority",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1224
+    },
+    {
+      "name": "list_pty_processes",
+      "file": "src-tauri/src/pty.rs",
+      "line": 1266
+    },
+    {
+      "name": "remote_control_info",
+      "file": "src-tauri/src/remote.rs",
+      "line": 534
+    },
+    {
+      "name": "remote_control_connected_devices",
+      "file": "src-tauri/src/remote.rs",
+      "line": 539
+    },
+    {
+      "name": "remote_control_open_pairing",
+      "file": "src-tauri/src/remote.rs",
+      "line": 544
+    },
+    {
+      "name": "remote_control_close_pairing",
+      "file": "src-tauri/src/remote.rs",
+      "line": 554
+    },
+    {
+      "name": "remote_control_revoke",
+      "file": "src-tauri/src/remote.rs",
+      "line": 561
+    },
+    {
+      "name": "remote_control_set_max_devices",
+      "file": "src-tauri/src/remote.rs",
+      "line": 569
+    },
+    {
+      "name": "remote_control_set_session_expiry",
+      "file": "src-tauri/src/remote.rs",
+      "line": 578
+    },
+    {
+      "name": "remote_control_set_read_only",
+      "file": "src-tauri/src/remote.rs",
+      "line": 588
+    },
+    {
+      "name": "remote_control_set_shell_input",
+      "file": "src-tauri/src/remote.rs",
+      "line": 595
+    },
+    {
+      "name": "remote_control_revoke_device",
+      "file": "src-tauri/src/remote.rs",
+      "line": 602
+    },
+    {
+      "name": "remote_control_set_enabled",
+      "file": "src-tauri/src/remote.rs",
+      "line": 609
+    },
+    {
+      "name": "set_resource_policy",
+      "file": "src-tauri/src/resources.rs",
+      "line": 546
+    },
+    {
+      "name": "update_pty_runtime_meta",
+      "file": "src-tauri/src/resources.rs",
+      "line": 555
+    },
+    {
+      "name": "get_runtime_snapshot",
+      "file": "src-tauri/src/resources.rs",
+      "line": 597
+    },
+    {
+      "name": "get_resource_metrics",
+      "file": "src-tauri/src/resource_manager.rs",
+      "line": 327
+    },
+    {
+      "name": "get_scheduler_tasks",
+      "file": "src-tauri/src/scheduler.rs",
+      "line": 308
+    },
+    {
+      "name": "trigger_scheduler_tick",
+      "file": "src-tauri/src/scheduler.rs",
+      "line": 320
+    },
+    {
+      "name": "cancel_task",
+      "file": "src-tauri/src/scheduler.rs",
+      "line": 336
+    },
+    {
+      "name": "skills_scan",
+      "file": "src-tauri/src/skills.rs",
+      "line": 437
+    },
+    {
+      "name": "skills_detail",
+      "file": "src-tauri/src/skills.rs",
+      "line": 444
+    },
+    {
+      "name": "skills_uninstall",
+      "file": "src-tauri/src/skills.rs",
+      "line": 451
+    },
+    {
+      "name": "speech_list_models",
+      "file": "src-tauri/src/speech.rs",
+      "line": 162
+    },
+    {
+      "name": "speech_list_input_devices",
+      "file": "src-tauri/src/speech.rs",
+      "line": 178
+    },
+    {
+      "name": "speech_model_states",
+      "file": "src-tauri/src/speech.rs",
+      "line": 183
+    },
+    {
+      "name": "speech_download_model",
+      "file": "src-tauri/src/speech.rs",
+      "line": 205
+    },
+    {
+      "name": "speech_delete_model",
+      "file": "src-tauri/src/speech.rs",
+      "line": 295
+    },
+    {
+      "name": "speech_start_capture",
+      "file": "src-tauri/src/speech.rs",
+      "line": 305
+    },
+    {
+      "name": "speech_stop_capture",
+      "file": "src-tauri/src/speech.rs",
+      "line": 321
+    },
+    {
+      "name": "speech_stop_and_transcribe",
+      "file": "src-tauri/src/speech.rs",
+      "line": 374
+    },
+    {
+      "name": "speech_transcribe",
+      "file": "src-tauri/src/speech.rs",
+      "line": 405
+    },
+    {
+      "name": "spotify_login",
+      "file": "src-tauri/src/spotify.rs",
+      "line": 264
+    },
+    {
+      "name": "spotify_logout",
+      "file": "src-tauri/src/spotify.rs",
+      "line": 330
+    },
+    {
+      "name": "spotify_status",
+      "file": "src-tauri/src/spotify.rs",
+      "line": 335
+    },
+    {
+      "name": "spotify_get_current",
+      "file": "src-tauri/src/spotify.rs",
+      "line": 425
+    },
+    {
+      "name": "get_memory_stats",
+      "file": "src-tauri/src/stats.rs",
+      "line": 102
+    },
+    {
+      "name": "get_telemetry_metrics",
+      "file": "src-tauri/src/telemetry.rs",
+      "line": 117
+    },
+    {
+      "name": "get_telemetry_traces",
+      "file": "src-tauri/src/telemetry.rs",
+      "line": 123
+    },
+    {
+      "name": "run_validation",
+      "file": "src-tauri/src/validation.rs",
+      "line": 22
+    },
+    {
+      "name": "worktree_provision",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 88
+    },
+    {
+      "name": "worktree_list",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 141
+    },
+    {
+      "name": "worktree_remove",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 179
+    },
+    {
+      "name": "worktree_lock",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 233
+    },
+    {
+      "name": "worktree_unlock",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 267
+    },
+    {
+      "name": "worktree_fetch_branch",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 287
+    },
+    {
+      "name": "worktree_commit_pending",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 319
+    },
+    {
+      "name": "worktree_pending_changes",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 402
+    },
+    {
+      "name": "worktree_commit_worktree",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 424
+    },
+    {
+      "name": "worktree_cleanup",
+      "file": "src-tauri/src/worktrees.rs",
+      "line": 444
+    }
+  ]
+}

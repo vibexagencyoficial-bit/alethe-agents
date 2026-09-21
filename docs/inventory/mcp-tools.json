@@ -1,0 +1,41 @@
+{
+  "generatedAt": "2026-09-21T01:28:04.353Z",
+  "source": "src-tauri/src/orchestrator_core.rs (fn tools)",
+  "counts": {
+    "tools": 8
+  },
+  "tools": [
+    {
+      "name": "alethe_delegate",
+      "description": "Hand independent units of work to worker agents that Alethe runs for you. Returns job ids immediately; the workers run in parallel. Delegate any unit that would make you read more than 5 files or that you estimate at over 2 minutes of your own work, and send every qualifying unit in ONE call so they run at the same time. Each task must be self contained."
+    },
+    {
+      "name": "alethe_check",
+      "description": "Collect what workers reported. With wait set it blocks until they settle. Process every delivery it returns before calling it again."
+    },
+    {
+      "name": "alethe_status",
+      "description": "Snapshot of every worker without blocking: status, elapsed time, current plan and token usage."
+    },
+    {
+      "name": "alethe_steer",
+      "description": "Correct a worker while its turn is still running, without killing it or losing its context. Use this instead of cancelling when the worker is heading the wrong way."
+    },
+    {
+      "name": "alethe_send",
+      "description": "Give a settled worker more work on its existing thread, keeping everything it already learned."
+    },
+    {
+      "name": "alethe_cancel",
+      "description": "Interrupt running workers."
+    },
+    {
+      "name": "alethe_release",
+      "description": "Let go of settled workers you have no more work for. Account for every worker you started: either send it more work or release it."
+    },
+    {
+      "name": "alethe_diff",
+      "description": "Read the unified diff a worker has produced so far."
+    }
+  ]
+}

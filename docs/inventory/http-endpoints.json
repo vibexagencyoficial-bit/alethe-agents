@@ -1,0 +1,264 @@
+{
+  "generatedAt": "2026-09-21T01:28:04.353Z",
+  "source": "src-tauri/src/control.rs (capabilities)",
+  "counts": {
+    "public": 5,
+    "authenticated": 58
+  },
+  "publicEndpoints": [
+    {
+      "method": "GET",
+      "path": "/control/v1/health"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/version"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/pairing/start"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/pairing/complete"
+    }
+  ],
+  "authenticatedEndpoints": [
+    {
+      "method": "GET",
+      "path": "/control/v1/runtime"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/agents"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/agents/spawn"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/agents/{id}"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/agents/{id}/send"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/agents/{id}/steer"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/agents/{id}/interrupt"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/agents/{id}/resume"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/agents/{id}/stop"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/agents/{id}/status"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/agents/{id}/output"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/projects"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/projects/{id}"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/targets"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/targets/{id}"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/terminals"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/terminals"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/terminals/{id}"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/terminals/{id}/input"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/terminals/{id}/scrollback"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/terminals/{id}/interrupt"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/terminals/{id}/restart"
+    },
+    {
+      "method": "DELETE",
+      "path": "/control/v1/terminals/{id}"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/fs/list"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/fs/read"
+    },
+    {
+      "method": "PUT",
+      "path": "/control/v1/fs/write"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/fs/mkdir"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/fs/move"
+    },
+    {
+      "method": "DELETE",
+      "path": "/control/v1/fs"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/git/status"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/git/diff"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/git/log"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/git/branches"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/git/incoming-outgoing"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/init"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/stage"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/unstage"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/discard"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/commit"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/pull"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/push"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/branch"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/cherry-pick"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/revert"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/git/reset"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/worktrees"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/worktrees"
+    },
+    {
+      "method": "DELETE",
+      "path": "/control/v1/worktrees/{agent}"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/worktrees/{agent}/changes"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/worktrees/{agent}/lock"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/worktrees/{agent}/unlock"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/worktrees/{agent}/fetch"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/worktrees/{agent}/commit"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/validation/run"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/events"
+    },
+    {
+      "method": "GET",
+      "path": "/control/v1/auth/session"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/auth/rotate"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/auth/revoke"
+    }
+  ]
+}
