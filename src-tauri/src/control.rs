@@ -697,7 +697,9 @@ fn read_json<T: DeserializeOwned>(request: &mut Request) -> Result<T, String> {
     serde_json::from_slice(&body).map_err(|_| "invalid_json_body".to_string())
 }
 
-fn health(port: u16) -> Value {
+/// `pub(crate)` porque o teste de concorrência do listener (`agent_events`) responde o payload
+/// real do `/health` em vez de um JSON de mentira.
+pub(crate) fn health(port: u16) -> Value {
     json!({
         "service": "alethe-control",
         "version": "1",

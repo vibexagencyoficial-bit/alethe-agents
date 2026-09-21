@@ -61,6 +61,7 @@ mod projects;
 mod provider_common;
 mod pty;
 mod remote;
+mod request_pool;
 mod resource_manager;
 mod resources;
 mod scheduler;
