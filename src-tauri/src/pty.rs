@@ -97,6 +97,58 @@ fn publish_agent_exit(agent_id: &str, teardown_reason: u8, code: Option<i32>) {
     );
 }
 
+/// Intervalo do poll do vigia de auto-saída. O processo morto continua morto em qualquer intervalo;
+/// o que este número decide é a latência entre sair e o `agent.completed/failed` sair pelo stream —
+/// 150ms é imperceptível para o consumidor e não custa CPU (um `GetExitCodeProcess` por volta).
+const PTY_EXIT_WATCH_POLL_MS: u64 = 150;
+
+/// Espera o processo do PTY sair POR CONTA PRÓPRIA e solta a console quando isso acontece.
+///
+/// Sem este vigia, o agente que termina sozinho (`exit` no shell, o CLI do agente encerrando) fica
+/// morto mas a sessão continua viva no mapa e o leitor continua bloqueado no `read()`: no ConPTY do
+/// Windows, matar/sair o filho NÃO fecha o pipe de saída — o `read()` só volta quando o master
+/// (HPCON) é solto. Como o caminho de fim mora depois do laço de leitura, o desfecho do agente nunca
+/// era publicado (`pty_exit`, `agent.completed/failed`) — medido no app real: o stream parava em
+/// `terminal.output`/`agent.working` e o caminho de fim nunca rodava.
+///
+/// Aqui o master é esvaziado (a console fecha, o leitor acorda, o canal fecha e o caminho de fim roda
+/// com o teardown ainda `normal`, ou seja, com o código real do processo) sem tirar a sessão do mapa:
+/// quem tira a sessão do mapa é o próprio caminho de fim. Kill/suspend/restart tiram a sessão do mapa
+/// ANTES de matar a árvore, então o vigia não encontra sessão para soltar e nunca rouba um kill em
+/// andamento — o `kill_pty` segue derrubando a árvore de processos como sempre.
+fn watch_pty_exit(
+    child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    sessions: &PtySessions,
+    id: &str,
+) {
+    loop {
+        let exited = child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok())
+            .flatten()
+            .is_some();
+        if exited {
+            let released = {
+                let Ok(sessions) = sessions.lock() else {
+                    return;
+                };
+                sessions.get(id).and_then(|session| {
+                    session
+                        .master
+                        .lock()
+                        .ok()
+                        .and_then(|mut master| master.take())
+                })
+            };
+            // soltar a console aqui é o ponto: o `drop` fecha o HPCON e acorda o leitor.
+            drop(released);
+            return;
+        }
+        thread::sleep(Duration::from_millis(PTY_EXIT_WATCH_POLL_MS));
+    }
+}
+
 /// Acumulador do `terminal.output`. O webview recebe chunk a chunk (terminal na tela) ou a atividade
 /// acumulada, mas o bus recebe marcos: aqui os bytes somam até o intervalo vencer, e o que se perdeu
 /// por estouro do buffer pendente entra no mesmo marco — o consumidor precisa saber que viu menos do
@@ -192,7 +244,14 @@ fn activity_emit_due(last_activity_emit: Option<Instant>, interval_ms: u128) -> 
 pub struct PtySession {
     pub pty_id: String,
 
-    pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// O master é a console: enquanto ele vive, o leitor bloqueado em `read()` não volta — no
+    /// ConPTY do Windows o `read()` só desbloqueia quando o HPCON é fechado (a mesma razão
+    /// documentada em `suspend_session`). Por isso ele é `Option`: o agente pode terminar sozinho
+    /// (`exit` no shell, o CLI saindo) e a sessão continua no mapa até o caminho de fim publicar o
+    /// desfecho — quem solta a console nesse caso é o vigia de auto-saída (`watch_pty_exit`), que
+    /// esvazia esta caixa sem tirar a sessão do mapa. Erro "pty_master_closed" em quem usar o master
+    /// depois disso é o comportamento correto: a console já foi embora.
+    pub master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
 
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
@@ -756,11 +815,26 @@ pub async fn spawn_pty(
             done_ready.notify_all();
         }
 
+        if pty_debug_enabled() {
+            let _ = append_spawn_log(
+                &debug_app,
+                &format!(
+                    "[pty-debug] {debug_id}: ler o stream terminou, teardown={} persistido={persisted}",
+                    teardown_reason_name(teardown_reason)
+                ),
+            );
+        }
         let code = thread_child
             .lock()
             .ok()
             .and_then(|mut child| child.wait().ok())
             .map(|status| status.exit_code() as i32);
+        if pty_debug_enabled() {
+            let _ = append_spawn_log(
+                &debug_app,
+                &format!("[pty-debug] {debug_id}: processo colhido, code={code:?}"),
+            );
+        }
         let reason = teardown_reason_name(teardown_reason);
         let _ = event_app.emit(&exit_event_name, PtyExitPayload { code, reason });
         remote_hub.publish(&scrollback_id, || {
@@ -797,9 +871,13 @@ pub async fn spawn_pty(
             ),
         );
 
+        let session_master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
+            Arc::new(Mutex::new(Some(pair.master)));
+        // o `child` abaixo entra na sessão (move), então o vigia guarda o clone antes
+        let watch_child = Arc::clone(&child);
         let session = PtySession {
             pty_id: id.clone(),
-            master: Arc::new(Mutex::new(pair.master)),
+            master: Arc::clone(&session_master),
             writer,
             child,
             scrollback,
@@ -816,6 +894,25 @@ pub async fn spawn_pty(
             .lock()
             .map_err(|_| "PTY sessions lock poisoned".to_string())?
             .insert(id.clone(), session);
+
+        // O vigia começa DEPOIS da sessão estar no mapa: ele só solta a console de uma sessão
+        // registrada, então um processo que saia antes disso não o deixa com o mapa vazio na mão.
+        {
+            let watch_sessions = sessions.clone();
+            let watch_id = id.clone();
+            let watch_debug_app = app.clone();
+            let _ = thread::Builder::new()
+                .name("alethe-pty-exit-watch".to_string())
+                .spawn(move || {
+                    watch_pty_exit(&watch_child, &watch_sessions, &watch_id);
+                    if pty_debug_enabled() {
+                        let _ = append_spawn_log(
+                            &watch_debug_app,
+                            &format!("[pty-debug] {watch_id}: processo saiu sozinho, console solta"),
+                        );
+                    }
+                });
+        }
 
         Ok(SpawnPtyResponse { id })
     })
@@ -1075,6 +1172,11 @@ pub async fn resize_pty(
             let master = master
                 .lock()
                 .map_err(|_| "PTY master lock poisoned".to_string())?;
+            // a console pode já ter ido embora (agente que saiu sozinho): redimensionar agora é erro
+            // do chamador, não motivo para segurar um master que não existe mais.
+            let master = master
+                .as_ref()
+                .ok_or_else(|| format!("PTY console closed: {id}"))?;
             master
                 .resize(PtySize {
                     rows: rows.max(1),
@@ -2079,5 +2181,183 @@ mod tests {
         let mut carry = first[valid..].to_vec();
         carry.extend_from_slice(&full[2..]); // + 0xA9
         assert_eq!(valid_utf8_prefix_len(&carry), carry.len());
+    }
+
+    /// ConPTY real, `cmd.exe` real, leitor bloqueado real: o agente que sai sozinho deixa o processo
+    /// morto e a console aberta, e o leitor só acorda quando o master é solto. Este teste prova as
+    /// duas metades do vigia — o poll vê a saída (e o código real do processo) e soltar a console é o
+    /// que destrava o leitor. Sem o `take` do master aqui, a segunda asserção estoura: é a falha que
+    /// aparecia no app (stream parando em `terminal.output`/`agent.working`, sem `agent.completed`).
+    #[cfg(windows)]
+    #[test]
+    fn self_exited_agent_unblocks_the_reader_only_when_the_console_is_released() {
+        let (session, child) = spawn_real_session("auto-saida-ok", "exit 0");
+        let sessions: PtySessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .unwrap()
+            .insert("auto-saida-ok".to_string(), session);
+
+        // leitor de verdade, bloqueado em read() como no spawn — só sai do laço quando o read volta
+        let mut reader = sessions
+            .lock()
+            .unwrap()
+            .get("auto-saida-ok")
+            .expect("sessão registrada")
+            .master
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("console aberta")
+            .try_clone_reader()
+            .expect("clonar o leitor real");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        // o poll do vigia vê a saída sozinha e traz o código real do processo
+        let status = wait_for_process_exit(&child, Duration::from_secs(15)).expect("processo saiu");
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "o código real do processo precisa sobreviver ao reap do vigia"
+        );
+
+        // com o processo morto e a console aberta o leitor continua bloqueado: este é o defeito
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "leitor não deveria voltar enquanto a console estiver aberta"
+        );
+
+        watch_pty_exit(&child, &sessions, "auto-saida-ok");
+
+        assert!(
+            sessions
+                .lock()
+                .unwrap()
+                .get("auto-saida-ok")
+                .expect("sessão ainda no mapa")
+                .master
+                .lock()
+                .unwrap()
+                .is_none(),
+            "o vigia precisa soltar a console da sessão registrada"
+        );
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(15)).is_ok(),
+            "soltar a console precisa destravar o leitor (é o que faz o caminho de fim rodar)"
+        );
+    }
+
+    /// A outra metade: o vigia solta a console da SESSÃO REGISTRADA, nunca a de uma sessão que já
+    /// saiu do mapa. Kill/suspend/restart tiram a sessão do mapa antes de matar a árvore; se o vigia
+    /// soltasse aquela console, o kill em andamento ficaria sem a sessão para derrubar a árvore. Tem
+    /// um vizinho vivo no mapa de propósito: pega também a variante que solte "a console de qualquer
+    /// sessão" em vez da do id pedido.
+    #[cfg(windows)]
+    #[test]
+    fn exit_watcher_never_releases_a_console_outside_its_session() {
+        let sessions: PtySessions = Arc::new(Mutex::new(HashMap::new()));
+        let (fora_do_mapa, child) = spawn_real_session("auto-saida-fora", "exit 9");
+        let fora_master = Arc::clone(&fora_do_mapa.master);
+        let (vizinho, _vizinho_child) = spawn_real_session("auto-saida-vizinho", "exit 11");
+        let vizinho_master = Arc::clone(&vizinho.master);
+        sessions
+            .lock()
+            .unwrap()
+            .insert("auto-saida-vizinho".to_string(), vizinho);
+
+        wait_for_process_exit(&child, Duration::from_secs(15)).expect("processo saiu");
+        watch_pty_exit(&child, &sessions, "auto-saida-fora");
+
+        assert!(
+            fora_master.lock().unwrap().is_some(),
+            "o vigia não pode soltar a console de uma sessão que não está mais no mapa"
+        );
+        assert!(
+            vizinho_master.lock().unwrap().is_some(),
+            "o vigia só solta a console da sessão do id dele, nunca a de outro agente"
+        );
+    }
+
+    /// Sobe um PTY real com um `cmd.exe` que sai sozinho e devolve a sessão já montada como o
+    /// `spawn_pty` a monta (master, writer e child reais). `acao` é o que o cmd faz (ex.: `exit 7`).
+    #[cfg(windows)]
+    fn spawn_real_session(
+        id: &str,
+        acao: &str,
+    ) -> (
+        PtySession,
+        Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    ) {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("abrir o ConPTY real");
+        let mut builder = portable_pty::CommandBuilder::new("cmd.exe");
+        builder.args(["/c", acao]);
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .expect("spawn do cmd.exe real");
+        // o slave segura a mesma `Inner` do master (e portanto o HPCON): solto aqui para que a console
+        // feche quando o master for solto, como acontece no `spawn_pty` (o slave cai no fim dele).
+        drop(pair.slave);
+        let writer = pair.master.take_writer().expect("writer real");
+        let child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>> =
+            Arc::new(Mutex::new(child));
+        (
+            PtySession {
+                pty_id: id.to_string(),
+                master: Arc::new(Mutex::new(Some(pair.master))),
+                writer: Arc::new(Mutex::new(writer)),
+                child: Arc::clone(&child),
+                scrollback: Arc::new(Mutex::new(ScrollbackBuffer::new(VecDeque::new()))),
+                reader_done: Arc::new((Mutex::new(None), Condvar::new())),
+                teardown: Arc::new(AtomicU8::new(TEARDOWN_NORMAL)),
+                command: None,
+                cwd: None,
+                read_active: Arc::new((Mutex::new(true), Condvar::new())),
+                visible: Arc::new(AtomicBool::new(true)),
+                opencode_nudge_lock: Arc::new(AtomicU64::new(0)),
+            },
+            child,
+        )
+    }
+
+    /// O poll que o vigia usa, com prazo: devolve o status final assim que o processo sai.
+    #[cfg(windows)]
+    fn wait_for_process_exit(
+        child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+        limit: Duration,
+    ) -> Option<portable_pty::ExitStatus> {
+        let started = Instant::now();
+        loop {
+            let status = child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok())
+                .flatten();
+            if status.is_some() {
+                return status;
+            }
+            if started.elapsed() >= limit {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(PTY_EXIT_WATCH_POLL_MS));
+        }
     }
 }
