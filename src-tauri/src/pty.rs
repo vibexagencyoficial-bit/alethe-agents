@@ -49,6 +49,54 @@ fn wait_for_spawnable_memory() {
     }
 }
 
+fn teardown_reason_name(teardown_reason: u8) -> &'static str {
+    match teardown_reason {
+        TEARDOWN_KILLED => "killed",
+        TEARDOWN_SUSPENDED => "suspended",
+        TEARDOWN_RESTARTED => "restarted",
+        _ => "exited",
+    }
+}
+
+/// Fim do PTY como o consumidor precisa ler: terminou bem, terminou mal ou fomos nós que paramos.
+/// `code` ausente é o exit code que não foi lido (o `wait` falhou) e não conta como sucesso;
+/// suspender/derrubar/reiniciar é parada nossa, não fim do agente — daí `agent.stopped` valer mesmo
+/// com exit code 0.
+fn classify_agent_exit(teardown_reason: u8, code: Option<i32>) -> &'static str {
+    match teardown_reason {
+        TEARDOWN_KILLED | TEARDOWN_SUSPENDED | TEARDOWN_RESTARTED => "agent.stopped",
+        _ if code == Some(0) => "agent.completed",
+        _ => "agent.failed",
+    }
+}
+
+/// O que o agente produziu, não o que ele escreveu: o texto da saída é do usuário (pode ter token
+/// impresso por engano, dump de ambiente, trecho de arquivo) e o evento é persistido pelo consumidor
+/// — o mesmo motivo que barra conteúdo nos outros eventos do control plane. O texto continua no
+/// webview e no scrollback do app; quem precisar dele pelo control plane usa a rota autenticada
+/// `/control/v1/agents/{id}/output`.
+fn terminal_output_payload(bytes: usize, dropped: usize) -> serde_json::Value {
+    serde_json::json!({ "bytes": bytes, "dropped_bytes": dropped })
+}
+
+/// Entra no bus pela porta única do control plane (`emit_control_event`), então passa pelo guarda de
+/// conteúdo. Fora do closure de leitura para o teste exercitar o mesmo caminho sem PTY.
+fn publish_terminal_output(agent_id: &str, bytes: usize, dropped: usize) {
+    crate::control::emit_control_event(
+        "terminal.output",
+        Some(agent_id.to_string()),
+        terminal_output_payload(bytes, dropped),
+    );
+}
+
+fn publish_agent_exit(agent_id: &str, teardown_reason: u8, code: Option<i32>) {
+    crate::control::emit_control_event(
+        classify_agent_exit(teardown_reason, code),
+        Some(agent_id.to_string()),
+        serde_json::json!({ "exit_code": code, "teardown": teardown_reason_name(teardown_reason) }),
+    );
+}
+
 // (~5.8 GB de folga) enquanto a RAM "livre" parecia OK. Comprometer de
 
 fn prepare_memory_for_boot() {
@@ -458,6 +506,24 @@ pub async fn spawn_pty(
                                                                                
         // amostrar o stream faria um agente em segundo plano nunca sair de
                                                                        
+        // `terminal.output` tem throttle próprio, independente do caminho do webview: com o terminal
+        // na tela cada chunk vai direto para o webview, e sem o throttle o bus receberia um evento por
+        // chunk — o SSE e o consumidor vivem de marcos, não de cada pedaço.
+        let mut last_output_emit: Option<Instant> = None;
+        let mut output_bytes: usize = 0;
+        let mut output_dropped: usize = 0;
+        let mut emit_terminal_output = |text: &str, dropped: usize| {
+            output_bytes += text.len();
+            output_dropped += dropped;
+            if activity_emit_due(last_output_emit, PTY_ACTIVITY_EMIT_INTERVAL_MS) {
+                publish_terminal_output(
+                    &scrollback_id,
+                    std::mem::take(&mut output_bytes),
+                    std::mem::take(&mut output_dropped),
+                );
+                last_output_emit = Some(Instant::now());
+            }
+        };
         let mut emit_data_or_activity = |text: &str| {
                                                                            
                                                                              
@@ -465,24 +531,29 @@ pub async fn spawn_pty(
             remote_hub.publish(&remote_pty_id, || {
                 serde_json::json!({ "type": "pty_output", "ptyId": &remote_pty_id, "text": text })
             });
-            if thread_visible.load(Ordering::Relaxed) {
+            let dropped = if thread_visible.load(Ordering::Relaxed) {
                 if !activity_pending.is_empty() {
                     activity_pending.clear();
                 }
                 let _ = event_app.emit(&event_name, text);
-                return;
-            }
-            activity_pending.push_str(text);
-            if activity_pending.len() > ACTIVITY_PENDING_CAP {
-                let drop_to = activity_pending.len() - ACTIVITY_PENDING_CAP;
-                let boundary = align_to_char_boundary(activity_pending.as_bytes(), drop_to);
-                activity_pending.drain(..boundary);
-            }
-            if activity_emit_due(last_activity_emit, PTY_ACTIVITY_EMIT_INTERVAL_MS) {
-                let _ = event_app.emit(&activity_event_name, activity_pending.as_str());
-                activity_pending.clear();
-                last_activity_emit = Some(Instant::now());
-            }
+                0
+            } else {
+                activity_pending.push_str(text);
+                let mut dropped = 0;
+                if activity_pending.len() > ACTIVITY_PENDING_CAP {
+                    let drop_to = activity_pending.len() - ACTIVITY_PENDING_CAP;
+                    let boundary = align_to_char_boundary(activity_pending.as_bytes(), drop_to);
+                    activity_pending.drain(..boundary);
+                    dropped = boundary;
+                }
+                if activity_emit_due(last_activity_emit, PTY_ACTIVITY_EMIT_INTERVAL_MS) {
+                    let _ = event_app.emit(&activity_event_name, activity_pending.as_str());
+                    activity_pending.clear();
+                    last_activity_emit = Some(Instant::now());
+                }
+                dropped
+            };
+            emit_terminal_output(text, dropped);
         };
 
         if let Some(warning) = initial_warning {
@@ -668,16 +739,14 @@ pub async fn spawn_pty(
             .ok()
             .and_then(|mut child| child.wait().ok())
             .map(|status| status.exit_code() as i32);
-        let reason = match teardown_reason {
-            TEARDOWN_KILLED => "killed",
-            TEARDOWN_SUSPENDED => "suspended",
-            TEARDOWN_RESTARTED => "restarted",
-            _ => "exited",
-        };
+        let reason = teardown_reason_name(teardown_reason);
         let _ = event_app.emit(&exit_event_name, PtyExitPayload { code, reason });
         remote_hub.publish(&scrollback_id, || {
             serde_json::json!({ "type": "pty_exit", "ptyId": &scrollback_id, "reason": reason })
         });
+        // O fim do agente entra no bus pela mesma porta dos outros eventos de ciclo de vida: quem
+        // acompanha pelo `/control/v1/events` precisa saber que ele acabou (e como), não só o webview.
+        publish_agent_exit(&scrollback_id, teardown_reason, code);
 
         if let Some(pid) = child_pid {
             if let Ok(mut sessions) = thread_sessions.lock() {
@@ -1650,6 +1719,111 @@ pub fn install_kill_on_close_guard() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Acumula do bus até esvaziar (depois de já ter visto algo), com o mesmo cuidado dos outros
+    /// testes que compartilham o bus do processo: só o que chega importa, o resto é de outro teste.
+    fn drain_bus(
+        receiver: &mut tokio::sync::broadcast::Receiver<crate::event_bus::EventBusPayload>,
+    ) -> Vec<crate::event_bus::EventBusPayload> {
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            match receiver.try_recv() {
+                Ok(event) => seen.push(event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    if !seen.is_empty() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        seen
+    }
+
+    /// O fim do PTY chega ao consumidor como terminou bem, terminou mal ou fomos nós que paramos — e
+    /// chega pelo bus de verdade, pela mesma porta que o PTY usa, com o payload sem conteúdo. Sem PTY
+    /// aqui: a classificação e a porta são o que está sob teste, o PTY real é o passo no app.
+    #[test]
+    fn agent_exit_events_say_completed_failed_or_stopped() {
+        assert_eq!(classify_agent_exit(TEARDOWN_NORMAL, Some(0)), "agent.completed");
+        assert_eq!(classify_agent_exit(TEARDOWN_NORMAL, Some(1)), "agent.failed");
+        assert_eq!(classify_agent_exit(TEARDOWN_NORMAL, None), "agent.failed");
+        assert_eq!(classify_agent_exit(TEARDOWN_KILLED, Some(0)), "agent.stopped");
+        assert_eq!(classify_agent_exit(TEARDOWN_SUSPENDED, Some(1)), "agent.stopped");
+        assert_eq!(classify_agent_exit(TEARDOWN_RESTARTED, None), "agent.stopped");
+
+        let cases = [
+            (TEARDOWN_NORMAL, Some(0), "agent.completed"),
+            (TEARDOWN_NORMAL, Some(3), "agent.failed"),
+            (TEARDOWN_NORMAL, None, "agent.failed"),
+            (TEARDOWN_KILLED, Some(0), "agent.stopped"),
+            (TEARDOWN_SUSPENDED, Some(0), "agent.stopped"),
+            (TEARDOWN_RESTARTED, Some(0), "agent.stopped"),
+        ];
+        let marker = nanoid::nanoid!(8);
+        let mut receiver = crate::event_bus::subscribe();
+        for (index, (teardown, code, _)) in cases.iter().enumerate() {
+            publish_agent_exit(&format!("saida-{marker}-{index}"), *teardown, *code);
+        }
+
+        let events = drain_bus(&mut receiver);
+        for (index, (teardown, code, expected)) in cases.iter().enumerate() {
+            let agent_id = format!("saida-{marker}-{index}");
+            let event = events
+                .iter()
+                .find(|event| event.agent_id.as_deref() == Some(agent_id.as_str()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fim do agente {agent_id} não chegou no bus (teardown {teardown}, code {code:?})"
+                    )
+                });
+            assert_eq!(
+                &event.event_type, expected,
+                "teardown {teardown} com code {code:?} precisa virar {expected}"
+            );
+            assert_eq!(event.data["exit_code"], serde_json::json!(code));
+            assert_eq!(
+                event.data["teardown"],
+                serde_json::json!(teardown_reason_name(*teardown))
+            );
+        }
+    }
+
+    /// Saída do agente é volume, não texto: o evento diz que ele produziu e quanto, nunca o que
+    /// escreveu. O caso com texto é o que este evento teria se alguém "melhorasse" o payload depois —
+    /// e ele não sai, porque a porta é a mesma do control plane, que recusa conteúdo.
+    #[test]
+    fn terminal_output_event_carries_volume_not_text() {
+        let agent_id = format!("saida-volume-{}", nanoid::nanoid!(8));
+        let mut receiver = crate::event_bus::subscribe();
+        publish_terminal_output(&agent_id, 1200, 7);
+        crate::control::emit_control_event(
+            "terminal.output",
+            Some(agent_id.clone()),
+            serde_json::json!({ "bytes": 10, "text": "conteúdo do agente" }),
+        );
+
+        let events = drain_bus(&mut receiver);
+        let mine: Vec<&crate::event_bus::EventBusPayload> = events
+            .iter()
+            .filter(|event| event.agent_id.as_deref() == Some(agent_id.as_str()))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "só o evento sem texto pode sair; saíram {:?}",
+            mine.iter()
+                .map(|event| event.data.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            mine[0].data,
+            serde_json::json!({ "bytes": 1200, "dropped_bytes": 7 }),
+            "o evento leva o volume e o que se perdeu por estouro do buffer"
+        );
+    }
 
     /// Guards the invariant that made every terminal stop accepting keystrokes at once:
     /// `kill_process_tree` runs `taskkill` and waits for it, and holding the child lock across

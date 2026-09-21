@@ -378,7 +378,10 @@ fn forbidden_event_key(value: &Value) -> Option<String> {
 /// Fonte única dos eventos de ciclo de vida do control plane: publica no event bus (tokio
 /// broadcast), que alimenta o webview e — pela ponte — o stream SSE. O SSE não recebe evento por
 /// outro caminho, para não existirem duas ordens de entrega para o mesmo ciclo de vida.
-fn emit_control_event(event_type: &str, agent_id: Option<String>, payload: Value) {
+///
+/// É a porta única, e por isso o ciclo de vida do PTY também entra por aqui em vez de chamar o bus
+/// direto: quem passa por esta função passa pelo guarda de conteúdo.
+pub(crate) fn emit_control_event(event_type: &str, agent_id: Option<String>, payload: Value) {
     if let Some(key) = forbidden_event_key(&payload) {
         // Falha fechada e barulhenta: o evento não sai e o motivo fica no stderr do app. Um emissor
         // novo que tente mandar conteúdo quebra no teste, não em produção.
@@ -1142,7 +1145,16 @@ fn agent_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &m
         }),
         ("POST", Some("send")) | ("POST", Some("steer")) => Some(match read_json::<AgentMessageInput>(request).and_then(|input| {
             let message = input.message.or(input.data).filter(|value| !value.is_empty()).ok_or_else(|| "agent_message_required".to_string())?;
+            // O consumidor precisa saber que o agente voltou a trabalhar, não o que foi escrito nele:
+            // a mensagem é do usuário e o evento é persistido. Sai o tamanho, não o texto.
+            let bytes = message.len();
+            let source = if action == Some("steer") { "steer" } else { "send" };
             terminal_write(app, id.clone(), message)?;
+            emit_control_event(
+                "agent.working",
+                Some(id.clone()),
+                json!({ "agent_id": id, "source": source, "message_bytes": bytes }),
+            );
             Ok::<Value, String>(json!({ "agent_id": id, "accepted": true }))
         }) {
             Ok(payload) => json_response(200, payload),
