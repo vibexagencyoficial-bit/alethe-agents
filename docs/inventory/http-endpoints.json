@@ -1,9 +1,9 @@
 {
-  "generatedAt": "2026-09-21T01:28:04.353Z",
+  "generatedAt": "2026-09-21T17:39:16.995Z",
   "source": "src-tauri/src/control.rs (capabilities)",
   "counts": {
     "public": 5,
-    "authenticated": 58
+    "authenticated": 57
   },
   "publicEndpoints": [
     {
@@ -55,10 +55,6 @@
     {
       "method": "POST",
       "path": "/control/v1/agents/{id}/interrupt"
-    },
-    {
-      "method": "POST",
-      "path": "/control/v1/agents/{id}/resume"
     },
     {
       "method": "POST",

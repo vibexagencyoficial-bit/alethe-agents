@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-09-21T01:28:04.351Z",
+  "generatedAt": "2026-09-21T17:39:16.993Z",
   "counts": {
-    "declared": 265,
-    "registered": 257,
+    "declared": 267,
+    "registered": 259,
     "registeredButNotDeclared": 0,
     "declaredButNotRegistered": 0
   },
@@ -10,10 +10,10 @@
   "declaredButNotRegistered": [
     "ghostty_set_focus (src-tauri/src/ghostty_bridge.rs:1044)",
     "ghostty_surface_exited (src-tauri/src/ghostty_bridge.rs:1053)",
-    "set_window_opacity (src-tauri/src/lib.rs:87)",
-    "set_window_opacity (src-tauri/src/lib.rs:109)",
-    "quit_app (src-tauri/src/lib.rs:526)",
-    "ping (src-tauri/src/lib.rs:535)",
+    "set_window_opacity (src-tauri/src/lib.rs:88)",
+    "set_window_opacity (src-tauri/src/lib.rs:110)",
+    "quit_app (src-tauri/src/lib.rs:529)",
+    "ping (src-tauri/src/lib.rs:538)",
     "save_project_plan (src-tauri/src/planning.rs:431)",
     "patch_project_plan (src-tauri/src/planning.rs:479)",
     "append_plan_diagram (src-tauri/src/planning.rs:523)"
@@ -353,6 +353,16 @@
       "name": "contract_check",
       "file": "src-tauri/src/contract_check.rs",
       "line": 244
+    },
+    {
+      "name": "control_pairing_pending",
+      "file": "src-tauri/src/control.rs",
+      "line": 1403
+    },
+    {
+      "name": "control_pairing_decide",
+      "file": "src-tauri/src/control.rs",
+      "line": 1410
     },
     {
       "name": "get_last_crash_report",
@@ -762,22 +772,22 @@
     {
       "name": "set_window_opacity",
       "file": "src-tauri/src/lib.rs",
-      "line": 87
+      "line": 88
     },
     {
       "name": "set_window_opacity",
       "file": "src-tauri/src/lib.rs",
-      "line": 109
+      "line": 110
     },
     {
       "name": "quit_app",
       "file": "src-tauri/src/lib.rs",
-      "line": 526
+      "line": 529
     },
     {
       "name": "ping",
       "file": "src-tauri/src/lib.rs",
-      "line": 535
+      "line": 538
     },
     {
       "name": "record_frontend_error",

@@ -740,7 +740,6 @@ fn capabilities() -> Value {
             { "method": "POST", "path": "/control/v1/agents/{id}/send" },
             { "method": "POST", "path": "/control/v1/agents/{id}/steer" },
             { "method": "POST", "path": "/control/v1/agents/{id}/interrupt" },
-            { "method": "POST", "path": "/control/v1/agents/{id}/resume" },
             { "method": "POST", "path": "/control/v1/agents/{id}/stop" },
             { "method": "GET", "path": "/control/v1/agents/{id}/status" },
             { "method": "GET", "path": "/control/v1/agents/{id}/output" },
@@ -964,6 +963,20 @@ fn agent_spawn(app: &AppHandle, input: AgentSpawnInput) -> Result<Value, String>
     Ok(payload)
 }
 
+/// Rotas reconhecidas e deliberadamente NÃO implementadas. `capabilities()` é a promessa feita ao
+/// consumidor, então não pode anunciar nada daqui: era o defeito do `resume`, anunciado em
+/// `/capabilities` e respondendo 409 fixo, como se a rota existisse. O teste
+/// `capabilities_never_announce_an_unimplemented_route` guarda isso.
+const NOT_IMPLEMENTED_ROUTES: &[(&str, &str)] = &[("POST", "/control/v1/agents/{id}/resume")];
+
+/// `resume` de agente: o control plane não persiste sessão de agente — agentes vivem como PTY em
+/// memória (`PtySessions`) e `restart_pty` exige que o chamador repasse command/cwd/extra_args —
+/// então não há sessão guardada para retomar. Responde 501 explícito, não anuncia a rota, e não
+/// carrega estado nenhum.
+fn agent_resume_route() -> Response<std::io::Cursor<Vec<u8>>> {
+    error_response(501, "agent_resume_not_implemented")
+}
+
 fn agent_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
     if method == "POST" && path == "/control/v1/agents/spawn" {
         return Some(match read_json::<AgentSpawnInput>(request).and_then(|input| agent_spawn(app, input)) {
@@ -1005,7 +1018,7 @@ fn agent_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &m
             Ok(()) => json_response(200, json!({ "stopped": true })),
             Err(error) => error_response(404, &error),
         }),
-        ("POST", Some("resume")) => Some(error_response(409, "resume_requires_persisted_agent_session")),
+        ("POST", Some("resume")) => Some(agent_resume_route()),
         _ => Some(error_response(404, "control_route_not_found")),
     }
 }
@@ -1595,5 +1608,69 @@ mod tests {
 
         // the test session lives in the real credential store; take it back out
         state().revoke(&token).expect("revoke test session");
+    }
+
+    /// Gate do Task 3: `capabilities()` é a promessa feita ao consumidor — a rota do `resume` era
+    /// anunciada ali e devolvia 409 fixo, sem existir. Nenhuma rota de `NOT_IMPLEMENTED_ROUTES`
+    /// pode aparecer nas duas listas anunciadas.
+    #[test]
+    fn capabilities_never_announce_an_unimplemented_route() {
+        let payload = capabilities();
+        let announced: Vec<(&str, &str)> = ["public_endpoints", "authenticated_endpoints"]
+            .iter()
+            .filter_map(|section| payload.get(*section).and_then(Value::as_array))
+            .flatten()
+            .map(|entry| {
+                (
+                    entry.get("method").and_then(Value::as_str).unwrap_or_default(),
+                    entry.get("path").and_then(Value::as_str).unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(!announced.is_empty(), "capabilities sem endpoints anunciados");
+
+        for &(method, path) in NOT_IMPLEMENTED_ROUTES {
+            assert!(
+                !announced
+                    .iter()
+                    .any(|(announced_method, announced_path)| *announced_method == method
+                        && *announced_path == path),
+                "capabilities anunciou {method} {path}, que o control plane não implementa"
+            );
+        }
+    }
+
+    /// A chamada real na rota (servidor e socket reais, como a suíte de pairing) precisa dizer que
+    /// não está implementada — nunca devolver o 409 antigo nem um 2xx de mentira.
+    #[test]
+    fn agent_resume_answers_not_implemented_over_real_http() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
+        let port = server.server_addr().to_ip().expect("ip listener").port();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let _ = request.respond(agent_resume_route());
+            }
+        });
+
+        let (status, body) = http_request(port, "/control/v1/agents/agent-1/resume", None);
+        assert_eq!(status, 501);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json body")["error"],
+            "agent_resume_not_implemented"
+        );
+
+        // o roteador tem de responder por esta função; a asserção fixa a forma do braço de
+        // propósito, para um stub inline não voltar (o literal do 409 antigo é quebrado em dois
+        // pedaços porque um literal inteiro casaria consigo mesmo)
+        let source = include_str!("control.rs");
+        assert!(
+            source.contains(r#"("POST", Some("resume")) => Some(agent_resume_route())"#),
+            "o roteador do resume precisa usar agent_resume_route()"
+        );
+        let retired_409 = concat!("resume_requires_", "persisted_agent_session");
+        assert!(
+            !source.contains(retired_409),
+            "o 409 do resume anunciado sem implementação não pode voltar"
+        );
     }
 }
