@@ -97,6 +97,42 @@ fn publish_agent_exit(agent_id: &str, teardown_reason: u8, code: Option<i32>) {
     );
 }
 
+/// Acumulador do `terminal.output`. O webview recebe chunk a chunk (terminal na tela) ou a atividade
+/// acumulada, mas o bus recebe marcos: aqui os bytes somam até o intervalo vencer, e o que se perdeu
+/// por estouro do buffer pendente entra no mesmo marco — o consumidor precisa saber que viu menos do
+/// que o agente produziu, não receber menos em silêncio.
+#[derive(Default)]
+struct TerminalOutputEmit {
+    last_emit: Option<Instant>,
+    bytes: usize,
+    dropped: usize,
+}
+
+impl TerminalOutputEmit {
+    fn record(&mut self, agent_id: &str, bytes: usize, dropped: usize) {
+        self.bytes += bytes;
+        self.dropped += dropped;
+        if !activity_emit_due(self.last_emit, PTY_ACTIVITY_EMIT_INTERVAL_MS) {
+            return;
+        }
+        self.flush(agent_id);
+        self.last_emit = Some(Instant::now());
+    }
+
+    /// Publica o que estiver acumulado. O fim do PTY chama isto: sem o flush, um burst seguido de
+    /// silêncio deixaria os últimos bytes só na memória, porque quem dispara o marco é o próximo chunk.
+    fn flush(&mut self, agent_id: &str) {
+        if self.bytes == 0 && self.dropped == 0 {
+            return;
+        }
+        publish_terminal_output(
+            agent_id,
+            std::mem::take(&mut self.bytes),
+            std::mem::take(&mut self.dropped),
+        );
+    }
+}
+
 // (~5.8 GB de folga) enquanto a RAM "livre" parecia OK. Comprometer de
 
 fn prepare_memory_for_boot() {
@@ -509,21 +545,7 @@ pub async fn spawn_pty(
         // `terminal.output` tem throttle próprio, independente do caminho do webview: com o terminal
         // na tela cada chunk vai direto para o webview, e sem o throttle o bus receberia um evento por
         // chunk — o SSE e o consumidor vivem de marcos, não de cada pedaço.
-        let mut last_output_emit: Option<Instant> = None;
-        let mut output_bytes: usize = 0;
-        let mut output_dropped: usize = 0;
-        let mut emit_terminal_output = |text: &str, dropped: usize| {
-            output_bytes += text.len();
-            output_dropped += dropped;
-            if activity_emit_due(last_output_emit, PTY_ACTIVITY_EMIT_INTERVAL_MS) {
-                publish_terminal_output(
-                    &scrollback_id,
-                    std::mem::take(&mut output_bytes),
-                    std::mem::take(&mut output_dropped),
-                );
-                last_output_emit = Some(Instant::now());
-            }
-        };
+        let mut output_emit = TerminalOutputEmit::default();
         let mut emit_data_or_activity = |text: &str| {
                                                                            
                                                                              
@@ -553,7 +575,7 @@ pub async fn spawn_pty(
                 }
                 dropped
             };
-            emit_terminal_output(text, dropped);
+            output_emit.record(&scrollback_id, text.len(), dropped);
         };
 
         if let Some(warning) = initial_warning {
@@ -746,6 +768,9 @@ pub async fn spawn_pty(
         });
         // O fim do agente entra no bus pela mesma porta dos outros eventos de ciclo de vida: quem
         // acompanha pelo `/control/v1/events` precisa saber que ele acabou (e como), não só o webview.
+        // O que sobrou no acumulador sai antes da classificação: o fim do PTY fecha os dois eventos
+        // na ordem em que o consumidor espera (a última saída, depois o desfecho).
+        output_emit.flush(&scrollback_id);
         publish_agent_exit(&scrollback_id, teardown_reason, code);
 
         if let Some(pid) = child_pid {
@@ -1790,6 +1815,99 @@ mod tests {
             );
         }
     }
+
+    /// O acumulador do `terminal.output`: o primeiro chunk publica na hora (marco do início), os
+    /// seguintes entram no mesmo marco até o intervalo vencer, e o que se perdeu no buffer pendente vai
+    /// junto. Tempo real aqui (nada de relógio falso): o intervalo é de 450ms e o teste espera passar.
+    #[test]
+    fn terminal_output_emit_publishes_marks_not_chunks() {
+        let agent_id = format!("saida-marcos-{}", nanoid::nanoid!(8));
+        let mine = |events: &[crate::event_bus::EventBusPayload]| -> Vec<serde_json::Value> {
+            events
+                .iter()
+                .filter(|event| event.agent_id.as_deref() == Some(agent_id.as_str()))
+                .map(|event| event.data.clone())
+                .collect()
+        };
+
+        let mut receiver = crate::event_bus::subscribe();
+        let mut output_emit = TerminalOutputEmit::default();
+        output_emit.record(&agent_id, 100, 0);
+        output_emit.record(&agent_id, 250, 0);
+        output_emit.record(&agent_id, 50, 12);
+        assert_eq!(
+            mine(&drain_bus(&mut receiver)),
+            vec![serde_json::json!({ "bytes": 100, "dropped_bytes": 0 })],
+            "o primeiro chunk abre o marco na hora; os seguintes entram no próximo"
+        );
+
+        thread::sleep(Duration::from_millis(PTY_ACTIVITY_EMIT_INTERVAL_MS as u64 + 20));
+        output_emit.record(&agent_id, 7, 0);
+        assert_eq!(
+            mine(&drain_bus(&mut receiver)),
+            vec![serde_json::json!({ "bytes": 307, "dropped_bytes": 12 })],
+            "vencido o intervalo, sai o acumulado com o que se perdeu"
+        );
+
+        output_emit.record(&agent_id, 9, 0);
+        output_emit.flush(&agent_id);
+        assert_eq!(
+            mine(&drain_bus(&mut receiver)),
+            vec![serde_json::json!({ "bytes": 9, "dropped_bytes": 0 })],
+            "o flush do fim do PTY publica o que sobrou, sem esperar outro chunk"
+        );
+
+        output_emit.flush(&agent_id);
+        assert!(
+            mine(&drain_bus(&mut receiver)).is_empty(),
+            "sem nada pendente, o flush não inventa evento"
+        );
+    }
+
+    /// O fio entre as duas pontas já testadas: a leitura precisa alimentar o acumulador nos dois
+    /// caminhos (terminal na tela ou não) e o fim do PTY precisa publicar a classificação. É
+    /// verificação estrutural, no estilo dos outros testes deste arquivo, porque o PTY de verdade
+    /// exige o app — e é o passo no app que fecha isso de ponta a ponta.
+    #[test]
+    fn the_reader_loop_wires_output_and_exit_into_the_bus() {
+        let source = include_str!("pty.rs");
+        let closure = source
+            .split("let mut emit_data_or_activity = |text: &str| {")
+            .nth(1)
+            .expect("closure de leitura")
+            .split("\n        };")
+            .next()
+            .expect("fim do closure");
+        assert!(
+            closure.contains("output_emit.record(&scrollback_id, text.len(), dropped)"),
+            "o closure precisa alimentar o acumulador com o que saiu e o que se perdeu: {closure}"
+        );
+        assert!(
+            closure.contains("let dropped = if thread_visible.load(Ordering::Relaxed)"),
+            "o caminho visível e o escondido precisam devolver o que se perdeu: {closure}"
+        );
+        assert!(
+            !closure.contains("return;"),
+            "o caminho visível não pode sair antes de alimentar o acumulador: {closure}"
+        );
+
+        let exit_point = source
+            .split("let reason = teardown_reason_name(teardown_reason);")
+            .nth(1)
+            .expect("ponto de saída do PTY")
+            .split("if let Some(pid) = child_pid")
+            .next()
+            .expect("fim do ponto de saída");
+        assert!(
+            exit_point.contains("output_emit.flush(&scrollback_id)"),
+            "o fim do PTY precisa publicar o que sobrou no acumulador: {exit_point}"
+        );
+        assert!(
+            exit_point.contains("publish_agent_exit(&scrollback_id, teardown_reason, code)"),
+            "o fim do PTY precisa publicar a classificação no bus: {exit_point}"
+        );
+    }
+
 
     /// Saída do agente é volume, não texto: o evento diz que ele produziu e quanto, nunca o que
     /// escreveu. O caso com texto é o que este evento teria se alguém "melhorasse" o payload depois —
