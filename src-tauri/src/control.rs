@@ -351,6 +351,19 @@ pub(crate) fn events_route(method: &str, path: &str, request: Request) -> Option
     None
 }
 
+/// Fonte única dos eventos de ciclo de vida do control plane: publica no event bus (tokio
+/// broadcast), que alimenta o webview e — pela ponte — o stream SSE. O SSE não recebe evento por
+/// outro caminho, para não existirem duas ordens de entrega para o mesmo ciclo de vida.
+fn emit_control_event(event_type: &str, agent_id: Option<String>, payload: Value) {
+    crate::event_bus::publish_event_simple(
+        event_type,
+        &format!("ctrl-{}", nanoid::nanoid!(12)),
+        None,
+        agent_id,
+        payload,
+    );
+}
+
 impl ControlState {
     fn new() -> Self {
         match load_sessions() {
@@ -453,9 +466,10 @@ impl ControlState {
         let client_id = challenge.client_id.clone();
         let status = challenge.status.as_str();
         drop(pairing);
-        publish_event(
+        emit_control_event(
             "pairing.decided",
-            &json!({ "client_id": client_id, "approved": approve, "status": status }),
+            None,
+            json!({ "client_id": client_id, "approved": approve, "status": status }),
         );
         Ok(json!({ "client_id": client_id, "status": status, "approved": approve }))
     }
@@ -1027,7 +1041,7 @@ fn agent_spawn(app: &AppHandle, input: AgentSpawnInput) -> Result<Value, String>
         terminal_write(app, id.clone(), format!("{task}\r\n"))?;
     }
     let payload = json!({ "agent_id": id, "agent": agent, "terminal": terminal, "status": "started", "source": "real Alethe PTY" });
-    publish_event("agent.started", &payload);
+    emit_control_event("agent.started", Some(id.clone()), payload.clone());
     Ok(payload)
 }
 
@@ -1666,16 +1680,10 @@ mod tests {
 
         // nomes exclusivos deste teste: o processo inteiro compartilha o mesmo bus, e os testes
         // rodam em paralelo
-        crate::event_bus::publish_event_simple(
-            "sse.bridge.first",
-            "bridge-first",
-            None,
-            None,
-            json!({ "marker": "um" }),
-        );
+        emit_control_event("sse.bridge.first", None, json!({ "marker": "um" }));
         crate::event_bus::publish_event_simple(
             "sse.bridge.second",
-            "bridge-second",
+            "sched-test",
             None,
             Some("agent-1".to_string()),
             json!({ "marker": "dois" }),
@@ -1697,9 +1705,8 @@ mod tests {
             "a ponte precisa preservar a ordem do bus: {frames}"
         );
         assert!(
-            frames.contains("\"correlation_id\":\"bridge-first\"")
-                && frames.contains("\"correlation_id\":\"bridge-second\""),
-            "o envelope do bus precisa chegar com o correlation_id de origem: {frames}"
+            frames.contains("\"correlation_id\":\"ctrl-"),
+            "evento do control plane precisa levar o envelope com correlation_id: {frames}"
         );
         assert!(
             frames.contains("\"marker\":\"um\"") && frames.contains("\"marker\":\"dois\""),
