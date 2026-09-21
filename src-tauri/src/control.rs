@@ -239,11 +239,58 @@ pub fn publish_event(event: &str, payload: &Value) {
 }
 
 fn subscribe_events() -> Receiver<String> {
+    ensure_bus_bridge();
     let (sender, receiver) = mpsc::channel();
     if let Ok(mut subscribers) = event_subscribers().lock() {
         subscribers.push(sender);
     }
     receiver
+}
+
+/// Ponte event bus → SSE. O bus é a fonte única do ciclo de vida (scheduler, supervisor, rotas do
+/// control plane, pty) e o `/control/v1/events` é o consumidor externo; sem a ponte o stream nasce
+/// quase vazio, que era o defeito desta task. Idempotente: a primeira assinatura liga.
+fn ensure_bus_bridge() {
+    static BRIDGE: OnceLock<()> = OnceLock::new();
+    if BRIDGE.set(()).is_err() {
+        return;
+    }
+    // Assinar ANTES de subir a thread: o broadcast só entrega para quem já era assinante no
+    // momento do envio, então um evento publicado antes de a thread ser escalonada (o que
+    // acontece sob carga) se perderia para sempre.
+    let mut receiver = crate::event_bus::subscribe();
+    let spawned = std::thread::Builder::new()
+        .name("alethe-bus-bridge".to_string())
+        .spawn(move || loop {
+            match receiver.blocking_recv() {
+                Ok(payload) => publish_event(&payload.event_type, &bus_envelope(&payload)),
+                // Perder eventos por lentidão não pode derrubar a ponte: o consumidor recebe um
+                // aviso com o tamanho do salto e o stream continua vivo.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    publish_event("bus.lagged", &json!({ "skipped": skipped }));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        });
+    if let Err(error) = spawned {
+        // O consumidor precisa saber que a ponte não subiu; sem isso ele esperaria para sempre num
+        // stream que só entrega `ready` e keep-alive. O OnceLock fica marcado de propósito: duas
+        // pontes ao mesmo tempo entregariam cada evento duplicado no SSE.
+        eprintln!("[event-bus] ponte para o SSE não subiu: {error}");
+        publish_event("bus.bridge_unavailable", &json!({ "error": error.to_string() }));
+    }
+}
+
+/// Envelope que vai no `data:` do frame SSE. O `event:` já carrega o tipo, então ele não se repete
+/// aqui; o resto do envelope vai inteiro para o consumidor filtrar por agente/correlação.
+fn bus_envelope(payload: &crate::event_bus::EventBusPayload) -> Value {
+    json!({
+        "timestamp_ms": payload.timestamp_ms,
+        "correlation_id": payload.correlation_id,
+        "task_id": payload.task_id,
+        "agent_id": payload.agent_id,
+        "data": payload.data,
+    })
 }
 
 fn stream_events(mut writer: Box<dyn Write + Send + 'static>, receiver: Receiver<String>) {
@@ -1480,6 +1527,10 @@ mod tests {
 
     use std::io::Read;
 
+    /// Os testes abaixo falam com o cofre real (Credential Manager) e com o desafio de pairing,
+    /// que são globais do processo: em paralelo um sobrescreve o outro. O lock serializa só eles.
+    static CREDENTIAL_TESTS: Mutex<()> = Mutex::new(());
+
     fn http_request(port: u16, path: &str, body: Option<&str>) -> (u16, String) {
         let body_text = body.unwrap_or("");
         let raw_request = format!(
@@ -1519,8 +1570,154 @@ mod tests {
         challenge.expires_at = SystemTime::now() - Duration::from_secs(1);
     }
 
+    /// Abre um stream SSE real: socket de verdade e cabeçalho HTTP escrito à mão, como o resto da
+    /// suíte. O stream não fecha (keep-alive de 30s), daí o timeout curto de leitura.
+    fn sse_connect(port: u16, token: &str) -> std::net::TcpStream {
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to control server");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("read timeout");
+        let raw = format!(
+            "GET /control/v1/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+        );
+        stream.write_all(raw.as_bytes()).expect("write sse request");
+        stream
+    }
+
+    /// Acumula do stream até todos os `needles` aparecerem ou o deadline estourar. Dois frames
+    /// podem chegar no mesmo recv, então a asserção de ordem é feita no buffer acumulado.
+    fn sse_read_until_all(
+        stream: &mut std::net::TcpStream,
+        needles: &[&str],
+        deadline: std::time::Instant,
+    ) -> String {
+        let mut buffer = String::new();
+        let mut chunk = [0u8; 4096];
+        while std::time::Instant::now() < deadline
+            && needles.iter().any(|needle| !buffer.contains(needle))
+        {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => buffer.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(_) => continue,
+            }
+        }
+        buffer
+    }
+
+    /// Parea de verdade (start → aprovação na janela → complete) e devolve o token.
+    fn pair_for_token(port: u16) -> String {
+        let start = json!({ "client_id": "transcripts" }).to_string();
+        let (status, _) = http_request(port, "/control/v1/pairing/start", Some(&start));
+        assert_eq!(status, 200);
+        state().pairing_decide(true).expect("approve");
+        let (status, body) = http_request(
+            port,
+            "/control/v1/pairing/complete",
+            Some(&pairing_body("transcripts", &window_code())),
+        );
+        assert_eq!(status, 200);
+        serde_json::from_str::<Value>(&body).expect("json body")["access_token"]
+            .as_str()
+            .expect("access token")
+            .to_string()
+    }
+
+    /// Step 1 da Task 4: o stream SSE precisa carregar o ciclo de vida que só existe no event bus
+    /// (scheduler, supervisor, rotas). Sem a ponte o stream nasce quase vazio — este teste é o gate
+    /// de que a ponte existe, preserva a ordem do bus e entrega o envelope com o data inteiro.
+    #[test]
+    fn sse_stream_bridges_the_event_bus_with_envelopes() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
+        let port = server.server_addr().to_ip().expect("ip listener").port();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let method = request.method().to_string();
+                let url = request.url().to_string();
+                let path = endpoint_path(&url).to_string();
+                if let Some(response) = pairing_route(&method, &path, &mut request) {
+                    let _ = request.respond(response);
+                    continue;
+                }
+                let request = match events_route(&method, &path, request) {
+                    Some(restored) => restored,
+                    None => continue,
+                };
+                let _ = request.respond(error_response(404, "control_route_not_found"));
+            }
+        });
+
+        let token = pair_for_token(port);
+        let mut stream = sse_connect(port, &token);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let opening = sse_read_until_all(&mut stream, &["event: ready"], deadline);
+        assert!(
+            opening.starts_with("HTTP/1.1 200"),
+            "SSE precisa abrir com 200: {opening}"
+        );
+        assert!(
+            opening.contains("Content-Type: text/event-stream"),
+            "SSE precisa ser text/event-stream: {opening}"
+        );
+
+        // nomes exclusivos deste teste: o processo inteiro compartilha o mesmo bus, e os testes
+        // rodam em paralelo
+        crate::event_bus::publish_event_simple(
+            "sse.bridge.first",
+            "bridge-first",
+            None,
+            None,
+            json!({ "marker": "um" }),
+        );
+        crate::event_bus::publish_event_simple(
+            "sse.bridge.second",
+            "bridge-second",
+            None,
+            Some("agent-1".to_string()),
+            json!({ "marker": "dois" }),
+        );
+
+        let frames = sse_read_until_all(
+            &mut stream,
+            &["event: sse.bridge.first", "event: sse.bridge.second"],
+            deadline,
+        );
+        let first_at = frames
+            .find("event: sse.bridge.first")
+            .unwrap_or_else(|| panic!("primeiro evento não chegou no SSE: {frames}"));
+        let second_at = frames
+            .find("event: sse.bridge.second")
+            .unwrap_or_else(|| panic!("segundo evento não chegou no SSE: {frames}"));
+        assert!(
+            first_at < second_at,
+            "a ponte precisa preservar a ordem do bus: {frames}"
+        );
+        assert!(
+            frames.contains("\"correlation_id\":\"bridge-first\"")
+                && frames.contains("\"correlation_id\":\"bridge-second\""),
+            "o envelope do bus precisa chegar com o correlation_id de origem: {frames}"
+        );
+        assert!(
+            frames.contains("\"marker\":\"um\"") && frames.contains("\"marker\":\"dois\""),
+            "o data do bus precisa chegar inteiro: {frames}"
+        );
+        assert!(
+            frames.contains("\"agent_id\":\"agent-1\""),
+            "o envelope do bus precisa manter agent_id: {frames}"
+        );
+
+        state().revoke(&token).expect("revoke test session");
+    }
+
     #[test]
     fn pairing_needs_a_window_approval_and_the_code_is_one_time() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let server = tiny_http::Server::http("127.0.0.1:0").expect("bind control server");
         let port = server.server_addr().to_ip().expect("ip listener").port();
         std::thread::spawn(move || {
