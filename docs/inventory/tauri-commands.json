@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-21T17:39:16.993Z",
+  "generatedAt": "2026-09-21T20:31:18.097Z",
   "counts": {
     "declared": 267,
     "registered": 259,
@@ -357,12 +357,12 @@
     {
       "name": "control_pairing_pending",
       "file": "src-tauri/src/control.rs",
-      "line": 1403
+      "line": 1774
     },
     {
       "name": "control_pairing_decide",
       "file": "src-tauri/src/control.rs",
-      "line": 1410
+      "line": 1781
     },
     {
       "name": "get_last_crash_report",
@@ -1047,72 +1047,72 @@
     {
       "name": "pty_exists",
       "file": "src-tauri/src/pty.rs",
-      "line": 222
+      "line": 306
     },
     {
       "name": "spawn_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 230
+      "line": 314
     },
     {
       "name": "restart_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 783
+      "line": 877
     },
     {
       "name": "attach_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 835
+      "line": 929
     },
     {
       "name": "clear_pty_scrollback",
       "file": "src-tauri/src/pty.rs",
-      "line": 877
+      "line": 971
     },
     {
       "name": "write_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 921
+      "line": 1015
     },
     {
       "name": "resize_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 952
+      "line": 1046
     },
     {
       "name": "kill_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 1050
+      "line": 1144
     },
     {
       "name": "suspend_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 1144
+      "line": 1238
     },
     {
       "name": "get_pty_cwd",
       "file": "src-tauri/src/pty.rs",
-      "line": 1156
+      "line": 1250
     },
     {
       "name": "set_pty_read_state",
       "file": "src-tauri/src/pty.rs",
-      "line": 1183
+      "line": 1277
     },
     {
       "name": "set_pty_visible",
       "file": "src-tauri/src/pty.rs",
-      "line": 1204
+      "line": 1298
     },
     {
       "name": "set_pty_priority",
       "file": "src-tauri/src/pty.rs",
-      "line": 1224
+      "line": 1318
     },
     {
       "name": "list_pty_processes",
       "file": "src-tauri/src/pty.rs",
-      "line": 1266
+      "line": 1360
     },
     {
       "name": "remote_control_info",
