@@ -40,3 +40,21 @@ export async function controlPairingDecide(approve: boolean): Promise<ControlPai
 export function onControlPairingRequested(handler: () => void): Promise<UnlistenFn> {
   return listen(CONTROL_PAIRING_REQUESTED_EVENT, () => handler())
 }
+
+/**
+ * Pushed by the control plane when it spawns a session on behalf of an external caller. The pane
+ * must attach to `pty_id` — the session that is already running — never spawn a second process.
+ */
+export const CONTROL_PANE_OPEN_EVENT = 'control://pane-open'
+
+export type ControlPaneOpenRequest = {
+  pty_id: string
+  runtime: string
+  cwd: string
+}
+
+export function onControlPaneOpen(
+  handler: (request: ControlPaneOpenRequest) => void,
+): Promise<UnlistenFn> {
+  return listen<ControlPaneOpenRequest>(CONTROL_PANE_OPEN_EVENT, (event) => handler(event.payload))
+}

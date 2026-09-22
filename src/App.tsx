@@ -52,6 +52,7 @@ import { WorkspaceView } from './components/WorkspaceView'
 import { useAgentBrowserOffers } from './hooks/useAgentBrowserOffers'
 import { useCliOpenRequests } from './hooks/useCliOpenRequests'
 import { useCloseConfirmation } from './hooks/useCloseConfirmation'
+import { useControlPaneRequests } from './hooks/useControlPaneRequests'
 import { useDiscordPresence } from './hooks/useDiscordPresence'
 import { useKeybindings } from './hooks/useKeybindings'
 import { useMcpIntroPrompt } from './hooks/useMcpIntroPrompt'
@@ -275,6 +276,7 @@ export default function App() {
   useResourceSupervisor(hydrated)
   useAgentBrowserOffers(playwrightEnabled)
   useCliOpenRequests(hydrated)
+  useControlPaneRequests(hydrated)
 
   useEffect(() => {
     void hydrate()

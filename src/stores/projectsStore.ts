@@ -199,6 +199,8 @@ export type ProjectsState = ProjectsFile & {
       firstTab: {
         type: AgentType
         cwd: string
+        /** Sessão já viva (spawn do control plane); o pane se liga a ela em vez de subir outra. */
+        ptyId?: string
         extraArgs?: string[]
         initialInput?: string
         handoff?: AgentHandoffBootstrap
@@ -219,6 +221,8 @@ export type ProjectsState = ProjectsFile & {
       firstTab: {
         type: AgentType
         cwd: string
+        /** Sessão já viva (spawn do control plane); o pane se liga a ela em vez de subir outra. */
+        ptyId?: string
         extraArgs?: string[]
         initialInput?: string
         handoff?: AgentHandoffBootstrap

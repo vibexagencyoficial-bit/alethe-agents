@@ -56,6 +56,8 @@ export function makeDefaultTerminal(args: {
   firstTab: {
     type: AgentType
     cwd: string
+    /** Sessão já viva para o pane se ligar (spawn do control plane). Ausente = o pane sobe a sua. */
+    ptyId?: string
     extraArgs?: string[]
     initialInput?: string
     handoff?: AgentHandoffBootstrap
@@ -87,7 +89,7 @@ export function makeDefaultTerminal(args: {
         name: args.firstTab.type,
         cwd: args.firstTab.cwd,
         lastUsedAt: now,
-        ptyId: null,
+        ptyId: args.firstTab.ptyId ?? null,
         extraArgs: args.firstTab.extraArgs,
         initialInput: args.firstTab.initialInput,
         handoff: args.firstTab.handoff,
