@@ -2074,21 +2074,8 @@ pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16
     } else if path.starts_with("/control/v1/terminals/") {
         terminal_route(&app, &method, path, url, &mut request)
             .unwrap_or_else(|| error_response(404, "control_route_not_found"))
-    } else if path == "/control/v1/auth/session" && method == "GET" {
-        match state().authenticate(token) {
-            Ok(session) => json_response(200, json!({ "authenticated": true, "client_id": session.client_id, "created_at": session.created_at, "expires_at": session.expires_at })),
-            Err(_) => unauthorized_response(),
-        }
-    } else if path == "/control/v1/auth/rotate" && method == "POST" {
-        match state().rotate(token) {
-            Ok(payload) => json_response(200, payload),
-            Err(_) => unauthorized_response(),
-        }
-    } else if path == "/control/v1/auth/revoke" && method == "POST" {
-        match state().revoke(token) {
-            Ok(payload) => json_response(200, payload),
-            Err(_) => unauthorized_response(),
-        }
+    } else if let Some(response) = auth_route(&method, path, token) {
+        response
     } else if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE") {
         error_response(405, "method_not_allowed")
     } else {
@@ -2096,6 +2083,34 @@ pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16
     };
     let _ = request.respond(response);
     true
+}
+
+/// As rotas de sessão (`/auth/session`, `/auth/rotate`, `/auth/revoke`). Estão aqui, e não inline no
+/// `handle_request`, porque a suíte de auth roda contra um listener real que não monta `AppHandle`:
+/// o harness de teste chama esta função, então o que a suíte exercita é o mesmo código que atende o
+/// cliente, e não uma cópia. `token` é o Bearer já autenticado pelo chamador — a checagem global de
+/// auth continua sendo a única porta, e nenhuma rota daqui afrouxa isso.
+fn auth_route(
+    method: &str,
+    path: &str,
+    token: &str,
+) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    let response = match (method, path) {
+        ("GET", "/control/v1/auth/session") => match state().authenticate(token) {
+            Ok(session) => json_response(200, json!({ "authenticated": true, "client_id": session.client_id, "created_at": session.created_at, "expires_at": session.expires_at })),
+            Err(_) => unauthorized_response(),
+        },
+        ("POST", "/control/v1/auth/rotate") => match state().rotate(token) {
+            Ok(payload) => json_response(200, payload),
+            Err(_) => unauthorized_response(),
+        },
+        ("POST", "/control/v1/auth/revoke") => match state().revoke(token) {
+            Ok(payload) => json_response(200, payload),
+            Err(_) => unauthorized_response(),
+        },
+        _ => return None,
+    };
+    Some(response)
 }
 
 fn terminal_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
@@ -2237,17 +2252,19 @@ mod tests {
     static CREDENTIAL_TESTS: Mutex<()> = Mutex::new(());
 
     /// Requisição HTTP crua com método e auth à escolha. O `http_request` da suíte de pairing é o
-    /// atalho de POST sem token em cima desta.
-    fn http_call(
+    /// atalho de POST sem token em cima desta. Devolve a resposta inteira (cabeçalho e corpo) porque
+    /// o contrato de auth inclui o desafio do esquema (`WWW-Authenticate`), que só existe no
+    /// cabeçalho — checar apenas o status deixaria o desafio sem teste.
+    fn http_call_raw(
         port: u16,
         method: &str,
         path: &str,
-        token: Option<&str>,
+        auth_header: Option<&str>,
         body: Option<&str>,
-    ) -> (u16, String) {
+    ) -> String {
         let body_text = body.unwrap_or("");
-        let auth = token
-            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        let auth = auth_header
+            .map(|header| format!("Authorization: {header}\r\n"))
             .unwrap_or_default();
         let raw_request = format!(
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_text}",
@@ -2257,16 +2274,32 @@ mod tests {
         stream.write_all(raw_request.as_bytes()).expect("write request");
         let mut raw = String::new();
         stream.read_to_string(&mut raw).expect("read response");
-        let status = raw
-            .split_whitespace()
+        raw
+    }
+
+    fn status_of(raw: &str) -> u16 {
+        raw.split_whitespace()
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
-            .expect("status code");
-        let body = raw
-            .split_once("\r\n\r\n")
+            .expect("status code")
+    }
+
+    fn body_of(raw: &str) -> String {
+        raw.split_once("\r\n\r\n")
             .map(|(_, body)| body.trim().to_string())
-            .unwrap_or_default();
-        (status, body)
+            .unwrap_or_default()
+    }
+
+    fn http_call(
+        port: u16,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, String) {
+        let header = token.map(|token| format!("Bearer {token}"));
+        let raw = http_call_raw(port, method, path, header.as_deref(), body);
+        (status_of(&raw), body_of(&raw))
     }
 
     fn http_request(port: u16, path: &str, body: Option<&str>) -> (u16, String) {
@@ -2309,6 +2342,9 @@ mod tests {
                     git_route(&method, &path, &url, &mut request)
                 } else if path.starts_with("/control/v1/validation/") {
                     validation_route(&method, &path, &mut request)
+                } else if let Some(response) = auth_route(&method, &path, token) {
+                    // as rotas de sessão são as de produção: a suíte de auth não pode testar cópia
+                    Some(response)
                 } else {
                     None
                 }
@@ -3281,6 +3317,167 @@ mod tests {
 
         // the test session lives in the real credential store; take it back out
         state().revoke(&token).expect("revoke test session");
+    }
+
+    /// Suíte de auth, parte 1: o que a porta de entrada recusa. Roda contra o listener real (porta
+    /// efêmera) e o caminho de auth de produção — o mesmo que atende o cliente —, com socket real.
+    /// O desafio do esquema entra na asserção porque um 401 sem `WWW-Authenticate` deixa o cliente
+    /// sem saber que precisa de Bearer; e o token desconhecido tem o formato plausível (48 chars),
+    /// para o teste não passar por acidente ao recusar lixo.
+    #[test]
+    fn the_unauthorized_contract_holds_over_real_http() {
+        let port = control_server();
+
+        let raw = http_call_raw(port, "GET", "/control/v1/auth/session", None, None);
+        assert_eq!(status_of(&raw), 401, "rota autenticada sem token: {raw}");
+        assert!(
+            raw.to_lowercase().contains("www-authenticate: bearer"),
+            "o 401 precisa anunciar o esquema: {raw}"
+        );
+        assert!(raw.contains("authentication_required"), "{raw}");
+
+        let raw = http_call_raw(
+            port,
+            "GET",
+            "/control/v1/auth/session",
+            Some("Token nao-e-bearer"),
+            None,
+        );
+        assert_eq!(status_of(&raw), 401, "esquema errado não pode virar token: {raw}");
+
+        let desconhecido = nanoid::nanoid!(48);
+        let (status, body) = http_call(port, "GET", "/control/v1/auth/session", Some(&desconhecido), None);
+        assert_eq!(status, 401, "token desconhecido com formato válido: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["error"],
+            "authentication_required"
+        );
+
+        // rota autenticada qualquer (não só a de sessão) passa pelo mesmo portão
+        let (status, _) = http_call(port, "GET", "/control/v1/fs/list?path=.", Some(&desconhecido), None);
+        assert_eq!(status, 401, "o portão é único, não rota a rota");
+    }
+
+    /// Suíte de auth, parte 2: o ciclo de vida da sessão inteiro na ordem em que um cliente vive —
+    /// parear, usar, rotacionar, revogar — e a sessão que expira sozinha. Tudo o que a suíte cria é
+    /// revogado no fim: sessão de teste válida sobrevivendo no cofre real seria credencial viva.
+    #[test]
+    fn a_session_rotates_revokes_and_expires_over_real_http() {
+        let _guard = CREDENTIAL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let port = control_server();
+        let client_id = format!("suite-auth-{}", nanoid::nanoid!(8));
+
+        let token = pair_over_http(port, &client_id);
+
+        // 1. a sessão pareada vale e se identifica
+        let (status, body) = http_call(port, "GET", "/control/v1/auth/session", Some(&token), None);
+        assert_eq!(status, 200, "{body}");
+        let payload: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(payload["authenticated"], true);
+        assert_eq!(payload["client_id"], client_id.as_str());
+        assert!(payload.get("access_token").is_none(), "a sessão não devolve o token de volta");
+
+        // 2. rotacionar troca o token e o antigo deixa de valer na hora (reuso recusado)
+        let (status, body) = http_call(port, "POST", "/control/v1/auth/rotate", Some(&token), None);
+        assert_eq!(status, 200, "{body}");
+        let novo = serde_json::from_str::<Value>(&body).expect("json")["access_token"]
+            .as_str()
+            .expect("access token")
+            .to_string();
+        assert_ne!(novo, token, "rotate precisa devolver outro token");
+        // O token é aleatório puro (`nanoid!(48)`), sem prefixo de tipo: o que o teste pode fixar é o
+        // tamanho e o alfabeto — nada de espaço ou quebra de linha, que quebraria o cabeçalho.
+        assert_eq!(novo.len(), 48);
+        assert!(
+            novo.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "o token precisa ser seguro para o cabeçalho Authorization"
+        );
+        assert_eq!(
+            http_call(port, "GET", "/control/v1/auth/session", Some(&token), None).0,
+            401,
+            "o token rotacionado não pode continuar valendo"
+        );
+        assert_eq!(
+            http_call(port, "GET", "/control/v1/auth/session", Some(&novo), None).0,
+            200
+        );
+
+        // 3. revogar mata a sessão, e revogar de novo é recusado (não é operação idempotente)
+        let (status, body) = http_call(port, "POST", "/control/v1/auth/revoke", Some(&novo), None);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json")["revoked"],
+            true,
+            "revoke precisa confirmar o que fez: {body}"
+        );
+        assert_eq!(
+            http_call(port, "GET", "/control/v1/auth/session", Some(&novo), None).0,
+            401
+        );
+        assert_eq!(
+            http_call(port, "POST", "/control/v1/auth/revoke", Some(&novo), None).0,
+            401,
+            "token já revogado não revoga de novo"
+        );
+
+        // 4. sessão expirada: 401 na porta e podada do cofre na mesma passada
+        let expirado = pair_over_http(port, &format!("{client_id}-expirado"));
+        {
+            let mut sessions = state().sessions.lock().expect("lock");
+            let entry = sessions
+                .iter_mut()
+                .find(|session| session.token_hash == token_hash(&expirado))
+                .expect("sessão pareada no cofre");
+            entry.expires_at = unix_seconds(SystemTime::now() - Duration::from_secs(1));
+        }
+        assert_eq!(
+            http_call(port, "GET", "/control/v1/auth/session", Some(&expirado), None).0,
+            401,
+            "sessão vencida não autentica"
+        );
+        assert!(
+            !state()
+                .sessions
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|session| session.token_hash == token_hash(&expirado)),
+            "a sessão vencida tem de sair do cofre na mesma passada"
+        );
+
+        // 5. nada desta suíte continua valendo no cofre real
+        let restantes = state()
+            .sessions
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|session| session.client_id.starts_with(&client_id))
+            .count();
+        assert_eq!(restantes, 0, "suíte de auth não pode deixar sessão viva");
+    }
+
+    /// Pareia de verdade sobre HTTP: start público, código lido só pela janela, aprovação da janela,
+    /// complete devolvendo o Bearer. O token nunca é impresso — o teste só confere forma e prefixo.
+    fn pair_over_http(port: u16, client_id: &str) -> String {
+        let start = json!({ "client_id": client_id }).to_string();
+        let (status, _) = http_request(port, "/control/v1/pairing/start", Some(&start));
+        assert_eq!(status, 200, "start do pareamento");
+        let body = pairing_body(client_id, &window_code());
+        state().pairing_decide(true).expect("janela aprova");
+        let (status, payload) = http_request(port, "/control/v1/pairing/complete", Some(&body));
+        assert_eq!(status, 200, "complete do pareamento: {payload}");
+        let token = serde_json::from_str::<Value>(&payload).expect("json")["access_token"]
+            .as_str()
+            .expect("access token")
+            .to_string();
+        assert_eq!(token.len(), 48);
+        assert!(
+            token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "token fora do alfabeto seguro para cabeçalho"
+        );
+        token
     }
 
     /// O evento sai do app e é persistido pelo consumidor: nada de conteúdo livre no payload. Este
