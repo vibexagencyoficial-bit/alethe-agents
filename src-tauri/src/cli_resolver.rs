@@ -2,7 +2,7 @@ use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use std::time::SystemTime;
 
@@ -213,8 +213,7 @@ fn resolve_cli_launcher(command: &str) -> Option<PathBuf> {
         dirs.extend(agent_search_dirs());
 
         for dir in &dirs {
-            for extension in ["cmd", "exe", "bat", "ps1"] {
-                let candidate = dir.join(format!("{command}.{extension}"));
+            for candidate in windows_launcher_candidates(dir, command) {
                 if candidate.is_file() {
                     return Some(candidate);
                 }
@@ -222,6 +221,26 @@ fn resolve_cli_launcher(command: &str) -> Option<PathBuf> {
         }
         None
     }
+}
+
+/// Candidatos de `command` dentro de um diretório, na ordem em que são procurados.
+///
+/// A extensão é acrescentada porque quem chama passa o nome do CLI como se digita no terminal
+/// (`claude`, `codex`). Só que o shell padrão do app já vem com a extensão (`pwsh.exe`): a busca
+/// antiga montava `pwsh.exe.exe` e nunca achava o próprio `pwsh.exe`, então o pwsh 7 instalado pela
+/// Store ficava invisível para o control plane enquanto o terminal do app o executava normalmente —
+/// e o gate de spawn recusava o runtime `shell` por "CLI não instalada". Nome que já traz extensão
+/// é procurado como veio, antes das variações.
+#[cfg(windows)]
+fn windows_launcher_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let mut candidates = ["cmd", "exe", "bat", "ps1"]
+        .iter()
+        .map(|extension| dir.join(format!("{command}.{extension}")))
+        .collect::<Vec<_>>();
+    if Path::new(command).extension().is_some() {
+        candidates.insert(0, dir.join(command));
+    }
+    candidates
 }
 
 #[derive(serde::Serialize, Debug, Clone, Default)]
@@ -1047,6 +1066,47 @@ mod tests {
         assert_eq!(
             split_windows_path_expanded(r"a;; b ;"),
             vec![PathBuf::from("a"), PathBuf::from("b")]
+        );
+    }
+
+    /// Regressão do defeito medido com o `shell`: `pwsh.exe` é o shell padrão do app e chegava ao
+    /// resolvedor já com extensão, que montava `pwsh.exe.exe`. O candidato com o nome exato precisa
+    /// vir primeiro e apontar para um arquivo real do diretório (diretório e arquivo de verdade,
+    /// não um mock de caminho).
+    #[cfg(windows)]
+    #[test]
+    fn a_command_that_already_carries_its_extension_is_a_candidate() {
+        let dir = std::env::temp_dir().join(format!("alethe-launcher-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir_all(&dir).expect("criar diretório temporário");
+        let real = dir.join("shell-de-prova.exe");
+        std::fs::write(&real, b"nao executa, so existe").expect("escrever o arquivo do runtime");
+
+        let candidates = windows_launcher_candidates(&dir, "shell-de-prova.exe");
+        assert_eq!(candidates[0], real, "o nome como veio vem antes das variações");
+        assert!(
+            candidates.iter().any(|candidate| candidate.is_file()),
+            "a busca tem que achar o arquivo real: {candidates:?}"
+        );
+
+        let bare = windows_launcher_candidates(&dir, "shell-de-prova");
+        assert!(
+            bare.contains(&dir.join("shell-de-prova.exe")) && !bare.contains(&dir.join("shell-de-prova")),
+            "sem extensão o nome puro não entra: {bare:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O mesmo defeito, ponta a ponta na função real: `where.exe` mora no System32, está no PATH
+    /// desta máquina e mesmo assim a resolução devolvia `None` (procurava `where.exe.exe`).
+    #[cfg(windows)]
+    #[test]
+    fn resolves_a_real_launcher_that_came_with_its_extension() {
+        let found = find_windows_cli_launcher("where.exe").expect("where.exe existe no System32");
+        assert!(found.is_file(), "o caminho devolvido tem que existir: {found:?}");
+        assert_eq!(
+            found.file_name().and_then(|name| name.to_str()),
+            Some("where.exe")
         );
     }
 
