@@ -64,6 +64,7 @@ mod remote;
 mod request_pool;
 mod resource_manager;
 mod resources;
+mod runtime_registry;
 mod scheduler;
 mod session_watcher;
 mod skills;

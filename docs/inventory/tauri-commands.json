@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-21T20:31:18.097Z",
+  "generatedAt": "2026-09-21T23:46:37.345Z",
   "counts": {
     "declared": 267,
     "registered": 259,
@@ -10,10 +10,10 @@
   "declaredButNotRegistered": [
     "ghostty_set_focus (src-tauri/src/ghostty_bridge.rs:1044)",
     "ghostty_surface_exited (src-tauri/src/ghostty_bridge.rs:1053)",
-    "set_window_opacity (src-tauri/src/lib.rs:88)",
-    "set_window_opacity (src-tauri/src/lib.rs:110)",
-    "quit_app (src-tauri/src/lib.rs:529)",
-    "ping (src-tauri/src/lib.rs:538)",
+    "set_window_opacity (src-tauri/src/lib.rs:89)",
+    "set_window_opacity (src-tauri/src/lib.rs:111)",
+    "quit_app (src-tauri/src/lib.rs:530)",
+    "ping (src-tauri/src/lib.rs:539)",
     "save_project_plan (src-tauri/src/planning.rs:431)",
     "patch_project_plan (src-tauri/src/planning.rs:479)",
     "append_plan_diagram (src-tauri/src/planning.rs:523)"
@@ -357,12 +357,12 @@
     {
       "name": "control_pairing_pending",
       "file": "src-tauri/src/control.rs",
-      "line": 1774
+      "line": 1928
     },
     {
       "name": "control_pairing_decide",
       "file": "src-tauri/src/control.rs",
-      "line": 1781
+      "line": 1935
     },
     {
       "name": "get_last_crash_report",
@@ -772,22 +772,22 @@
     {
       "name": "set_window_opacity",
       "file": "src-tauri/src/lib.rs",
-      "line": 88
+      "line": 89
     },
     {
       "name": "set_window_opacity",
       "file": "src-tauri/src/lib.rs",
-      "line": 110
+      "line": 111
     },
     {
       "name": "quit_app",
       "file": "src-tauri/src/lib.rs",
-      "line": 529
+      "line": 530
     },
     {
       "name": "ping",
       "file": "src-tauri/src/lib.rs",
-      "line": 538
+      "line": 539
     },
     {
       "name": "record_frontend_error",
@@ -1047,72 +1047,72 @@
     {
       "name": "pty_exists",
       "file": "src-tauri/src/pty.rs",
-      "line": 306
+      "line": 365
     },
     {
       "name": "spawn_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 314
+      "line": 373
     },
     {
       "name": "restart_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 877
+      "line": 974
     },
     {
       "name": "attach_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 929
+      "line": 1026
     },
     {
       "name": "clear_pty_scrollback",
       "file": "src-tauri/src/pty.rs",
-      "line": 971
+      "line": 1068
     },
     {
       "name": "write_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 1015
+      "line": 1112
     },
     {
       "name": "resize_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 1046
+      "line": 1143
     },
     {
       "name": "kill_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 1144
+      "line": 1246
     },
     {
       "name": "suspend_pty",
       "file": "src-tauri/src/pty.rs",
-      "line": 1238
+      "line": 1340
     },
     {
       "name": "get_pty_cwd",
       "file": "src-tauri/src/pty.rs",
-      "line": 1250
+      "line": 1352
     },
     {
       "name": "set_pty_read_state",
       "file": "src-tauri/src/pty.rs",
-      "line": 1277
+      "line": 1379
     },
     {
       "name": "set_pty_visible",
       "file": "src-tauri/src/pty.rs",
-      "line": 1298
+      "line": 1400
     },
     {
       "name": "set_pty_priority",
       "file": "src-tauri/src/pty.rs",
-      "line": 1318
+      "line": 1420
     },
     {
       "name": "list_pty_processes",
       "file": "src-tauri/src/pty.rs",
-      "line": 1360
+      "line": 1462
     },
     {
       "name": "remote_control_info",

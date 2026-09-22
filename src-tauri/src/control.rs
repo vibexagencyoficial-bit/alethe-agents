@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tiny_http::{Header, Request, Response, StatusCode};
 
@@ -78,6 +78,14 @@ struct AgentSpawnInput {
 struct AgentMessageInput {
     message: Option<String>,
     data: Option<String>,
+}
+
+/// Corpo da rota de prova. `dir` é opcional: sem ele o app cria uma pasta temporária própria. O
+/// chamador NÃO manda args nem prompts — quem dirige a prova é o app (ver `run_runtime_proof`).
+#[derive(Debug, Deserialize)]
+struct RuntimeProofInput {
+    #[serde(default)]
+    dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -908,6 +916,7 @@ fn capabilities() -> Value {
         "authenticated_endpoints": [
             { "method": "GET", "path": "/control/v1/runtime" },
             { "method": "GET", "path": "/control/v1/agents" },
+            { "method": "POST", "path": "/control/v1/runtimes/{id}/proof" },
             { "method": "POST", "path": "/control/v1/agents/spawn" },
             { "method": "GET", "path": "/control/v1/agents/{id}" },
             { "method": "POST", "path": "/control/v1/agents/{id}/send" },
@@ -1007,19 +1016,36 @@ fn probe_agent(id: &str, command: &str, execution_supported: bool) -> Value {
     })
 }
 
-fn agents() -> Value {
-    let entries = [
-        ("shell", "pwsh.exe", true),
-        ("codex", "codex", true),
-        ("claude", "claude", true),
-        ("opencode", "opencode", true),
-        ("antigravity", "antigravity", false),
-        ("cursor", "cursor", false),
-        ("copilot", "github-copilot", false),
-        ("mimo", "mimo", false),
-        ("freebuff", "freebuff", false),
-    ];
-    json!({ "agents": entries.into_iter().map(|(id, command, supported)| probe_agent(id, command, supported)).collect::<Vec<_>>() })
+/// O que o control plane sabe de cada runtime, do registry e não de uma lista escrita à mão:
+/// descoberta do launcher (instalado), prova de efeito (executável pelo control plane) e o perfil
+/// irrestrito que o app usa, para o chamador pedir os mesmos args em vez de adivinhar.
+fn agents(app: &AppHandle) -> Value {
+    let proofs = crate::runtime_registry::load_proofs(app);
+    let entries = crate::runtime_registry::RUNTIMES
+        .iter()
+        .map(|runtime| {
+            let proof = proofs.get(runtime.id);
+            let mut probe = probe_agent(
+                runtime.id,
+                runtime.command,
+                crate::runtime_registry::proof_ok(&proofs, runtime.id),
+            );
+            if let Some(proof) = proof {
+                probe["proof"] = json!({
+                    "ok": proof.ok,
+                    "spawn_ok": proof.spawn_ok,
+                    "steer_ok": proof.steer_ok,
+                    "agent_id": proof.agent_id,
+                    "args": proof.args,
+                    "boot_inputs": proof.boot_inputs,
+                    "proved_at_ms": proof.proved_at_ms,
+                });
+            }
+            probe["unrestricted_args"] = json!(runtime.unrestricted_args);
+            probe
+        })
+        .collect::<Vec<_>>();
+    json!({ "agents": entries, "source": "runtime registry (descoberta + prova de efeito)" })
 }
 
 fn projects_payload(app: &AppHandle) -> Result<Value, String> {
@@ -1112,22 +1138,55 @@ fn valid_runtime_id(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// Evento de UI: a sessão que o control plane subiu tem de aparecer na janela **ligada a este pty
+/// id**. Antes disto o spawn externo rodava invisível — o renderer monta os panes do próprio store
+/// e nunca ficava sabendo da sessão; quem dirigia o control plane por codex e outros harnesses via
+/// o processo vivo no `/terminals` e nenhum pane na tela.
+pub const PANE_OPEN_EVENT: &str = "control://pane-open";
+
+/// Payload do anúncio: só o que o renderer precisa para achar o projeto e se ligar à sessão que já
+/// existe. O id vai junto porque subir um segundo processo só para desenhar o pane seria o defeito
+/// — o pane tem de mostrar a sessão real. Nada de tarefa, texto de pedido ou credencial: este é um
+/// canal de UI, não de conteúdo.
+fn pane_open_payload(pty_id: &str, runtime: &str, cwd: Option<&str>) -> Value {
+    json!({
+        "pty_id": pty_id,
+        "runtime": runtime,
+        "cwd": cwd.unwrap_or_default(),
+    })
+}
+
+fn announce_pane_open(app: &AppHandle, pty_id: &str, runtime: &str, cwd: Option<&str>) {
+    let _ = app.emit(PANE_OPEN_EVENT, pane_open_payload(pty_id, runtime, cwd));
+}
+
 fn agent_spawn(app: &AppHandle, input: AgentSpawnInput) -> Result<Value, String> {
     let agent = input.agent.trim().to_lowercase();
-    if !matches!(agent.as_str(), "shell" | "claude" | "codex" | "opencode") {
-        return Err(format!("agent_runtime_not_supported:{agent}"));
-    }
     let id = valid_runtime_id(&input.id.unwrap_or_else(|| format!("agent-{}", nanoid::nanoid!(12))))?;
+    // O gate é o registry, não uma lista escrita à mão: runtime conhecido + CLI instalado + efeito
+    // comprovado (prova no disco). Recusar aqui é o contrato da Task 5 — `execution_supported` só é
+    // verdadeiro com prova, e a recusa diz qual etapa falta.
+    if let Some(reason) = crate::runtime_registry::spawn_denied_reason_from(
+        &crate::runtime_registry::load_proofs(app),
+        crate::runtime_registry::spec(&agent)
+            .and_then(|runtime| crate::cli_resolver::find_windows_cli_launcher(runtime.command))
+            .is_some(),
+        &agent,
+    ) {
+        return Err(reason);
+    }
+    let cwd = input.cwd.clone();
     let terminal = terminal_start(app, TerminalStartInput {
         cols: input.cols,
         rows: input.rows,
         id: Some(id.clone()),
         command: Some(agent.clone()),
-        cwd: input.cwd,
+        cwd: cwd.clone(),
         extra_args: input.extra_args,
         launcher_override: input.launcher_override,
         env: input.env,
     })?;
+    announce_pane_open(app, &id, &agent, cwd.as_deref());
     if let Some(task) = input.task.filter(|value| !value.trim().is_empty()) {
         terminal_write(app, id.clone(), format!("{task}\r\n"))?;
     }
@@ -1150,8 +1209,303 @@ fn agent_resume_route() -> Response<std::io::Cursor<Vec<u8>>> {
     error_response(501, "agent_resume_not_implemented")
 }
 
-fn agent_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
-    if method == "POST" && path == "/control/v1/agents/spawn" {
+/// Prova de efeito de um runtime: `POST /control/v1/runtimes/{id}/proof` (corpo opcional `{dir}`).
+///
+/// Quem dirige a prova é o APP, não o chamador. O gate do spawn recusa runtime sem prova, e provar
+/// exige executar o runtime — este é o único caminho que executa um runtime ainda não provado, e ele
+/// executa um contrato fixo: o app cria a pasta (se o chamador não indicar uma), sobe o runtime com o
+/// perfil irrestrito do próprio registry (o mesmo `UNRESTRICTED_FLAG` que o humano liga no terminal),
+/// manda criar `proof-<id>.txt` com `<ID>_OK`, espera o arquivo no disco, manda ALTERAR para
+/// `<ID>_STEER_OK` (steer de verdade, na mesma sessão) e espera de novo. Nada de tarefa arbitrária em
+/// runtime não provado: o que o chamador escolhe é a pasta, e o app escolhe o resto.
+///
+/// O efeito é medido lendo o arquivo no disco, etapa por etapa, e o registro só fica `ok` com as duas
+/// etapas — a palavra de quem chamou não entra na conta. O pedido é longo de propósito (o runtime
+/// pensa): a rota responde quando a prova termina, e o listener atende em thread própria (Task 2),
+/// então um pedido longo não segura os outros.
+fn runtime_proof_route(app: &AppHandle, id: &str, input: RuntimeProofInput) -> Response<std::io::Cursor<Vec<u8>>> {
+    let Some(runtime) = crate::runtime_registry::spec(id) else {
+        return error_response(422, &format!("agent_runtime_not_supported:{id}"));
+    };
+    if crate::cli_resolver::find_windows_cli_launcher(runtime.command).is_none() {
+        return error_response(422, &format!("runtime_unavailable:{}", runtime.command));
+    }
+    let dir = match input.dir.map(|dir| dir.trim().to_string()).filter(|dir| !dir.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::env::temp_dir().join(format!("alethe-proof-{id}-{}", nanoid::nanoid!(8))),
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        return error_response(500, &format!("proof_dir_create_failed:{error}"));
+    }
+    let dir = dir.to_string_lossy().into_owned();
+    let agent_id = format!("proof-{id}-{}", nanoid::nanoid!(6));
+    let args = runtime
+        .unrestricted_args
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect::<Vec<_>>();
+
+    match run_runtime_proof(app, id, &agent_id, &dir, &args) {
+        Ok(record) => {
+            let payload = json!({
+                "runtime": id,
+                "command": runtime.command,
+                "dir": dir,
+                "execution_supported": record.ok,
+                "proof": record,
+            });
+            if record.ok {
+                json_response(200, payload)
+            } else {
+                json_response(422, payload)
+            }
+        }
+        Err(error) => error_response(500, &error),
+    }
+}
+
+/// Executa o contrato da prova e devolve o registro do que foi medido. Cada etapa exige o arquivo no
+/// disco com o conteúdo exato: `spawn` = o runtime criou; `steer` = o runtime obedeceu uma segunda
+/// instrução na mesma sessão. Falha em qualquer ponto encerra a sessão e devolve o registro parcial
+/// (com o motivo), porque meia prova é informação, não sucesso.
+fn run_runtime_proof(
+    app: &AppHandle,
+    id: &str,
+    agent_id: &str,
+    dir: &str,
+    args: &[String],
+) -> Result<crate::runtime_registry::ProofRecord, String> {
+    let started = terminal_start(
+        app,
+        TerminalStartInput {
+            cols: Some(120),
+            rows: Some(30),
+            id: Some(agent_id.to_string()),
+            command: Some(id.to_string()),
+            cwd: Some(dir.to_string()),
+            extra_args: Some(args.to_vec()),
+            launcher_override: None,
+            env: None,
+        },
+    );
+    if let Err(error) = started {
+        return Ok(crate::runtime_registry::ProofRecord {
+            detail: format!("spawn falhou: {error}"),
+            ..crate::runtime_registry::ProofRecord::new(id, agent_id, args.to_vec(), dir)
+        });
+    }
+
+    let file = std::path::Path::new(dir).join(crate::runtime_registry::proof_file_name(id));
+    let mut record = crate::runtime_registry::ProofRecord::new(id, agent_id, args.to_vec(), dir);
+    record.file = file.to_string_lossy().into_owned();
+
+    // O CLI precisa terminar de subir antes de receber texto: o prompt digitado cedo demais se perde
+    // na tela de boot. Espera a saída parar de crescer (a TUI desenhou e está esperando) com teto.
+    wait_for_output_to_settle(app, agent_id, Duration::from_secs(25), Duration::from_millis(1500));
+
+    // Antes do pedido, o handshake do runtime: CLIs de agente abrem diálogos de primeira execução
+    // por conta própria (o claude pergunta se confia na pasta e fica esperando resposta — medido no
+    // scrollback da sessão de prova). O texto do pedido digitado dentro desse diálogo não vira ação.
+    // O handshake do registry fecha o diálogo aceitando a opção padrão, como faria um humano.
+    for input in crate::runtime_registry::boot_inputs(id) {
+        if let Err(error) = terminal_write(app, agent_id.to_string(), format!("{input}\r")) {
+            record.detail = format!("handshake de boot falhou: {error}");
+            return close_proof(app, agent_id, record);
+        }
+        record.boot_inputs.push((*input).to_string());
+        wait_for_output_to_settle(app, agent_id, Duration::from_secs(20), Duration::from_millis(1200));
+    }
+
+    let spawn_prompt = crate::runtime_registry::proof_prompt(id, dir, crate::runtime_registry::ProofStage::Spawn);
+    if let Err(error) = send_prompt(app, agent_id, &spawn_prompt) {
+        record.detail = format!("send do spawn falhou: {error}");
+        return close_proof(app, agent_id, record);
+    }
+    let spawn_seen = wait_for_proof_file(
+        &file,
+        &crate::runtime_registry::proof_expected(id, crate::runtime_registry::ProofStage::Spawn),
+        Duration::from_secs(240),
+    );
+    record.spawn_ok = spawn_seen;
+    if !spawn_seen {
+        record.detail = "etapa spawn sem efeito: arquivo não apareceu com o conteúdo esperado".to_string();
+        return close_proof(app, agent_id, record);
+    }
+    record.content = crate::runtime_registry::proof_expected(id, crate::runtime_registry::ProofStage::Spawn);
+
+    let steer_prompt = crate::runtime_registry::proof_prompt(id, dir, crate::runtime_registry::ProofStage::Steer);
+    if let Err(error) = send_prompt(app, agent_id, &steer_prompt) {
+        record.detail = format!("steer falhou: {error}");
+        return close_proof(app, agent_id, record);
+    }
+    let steer_seen = wait_for_proof_file(
+        &file,
+        &crate::runtime_registry::proof_expected(id, crate::runtime_registry::ProofStage::Steer),
+        Duration::from_secs(240),
+    );
+    record.steer_ok = steer_seen;
+    record.ok = record.spawn_ok && record.steer_ok;
+    record.detail = if steer_seen {
+        "spawn e steer medidos no disco".to_string()
+    } else {
+        "etapa steer sem efeito: o arquivo não mudou para o conteúdo esperado".to_string()
+    };
+    if steer_seen {
+        record.content = crate::runtime_registry::proof_expected(id, crate::runtime_registry::ProofStage::Steer);
+    }
+
+    close_proof(app, agent_id, record)
+}
+
+/// Fecha a prova: guarda o rastro da sessão, encerra a sessão e grava o registro — inclusive quando
+/// a etapa falhou. Registro de falha não é ruído: é o que faz o gate responder *por que* aquele
+/// runtime está sem prova (e o que sobrevive ao scrollback, que morre com a sessão).
+fn close_proof(
+    app: &AppHandle,
+    agent_id: &str,
+    mut record: crate::runtime_registry::ProofRecord,
+) -> Result<crate::runtime_registry::ProofRecord, String> {
+    record.output_tail = proof_output_tail(app, agent_id);
+    let _ = terminal_kill(app, agent_id.to_string());
+    let _ = crate::runtime_registry::record_proof(app, &record)?;
+    Ok(record)
+}
+
+/// Manda um pedido como um humano manda: o texto numa escrita e o Enter noutra, com uma pausa entre
+/// as duas. Medido: com o texto e o `\r` na mesma escrita, a TUI trata o Enter como parte de um paste
+/// e o pedido fica parado no campo de entrada — foi assim que claude, codex, opencode e antigravity
+/// ficaram 240s "sem efeito" com o CLI pronto na tela; com o Enter separado, o antigravity escreveu o
+/// arquivo da prova em 25s. No shell (pwsh) o Enter executa o comando do mesmo jeito, então o mesmo
+/// caminho serve para os dois drivers.
+fn send_prompt(app: &AppHandle, agent_id: &str, prompt: &str) -> Result<(), String> {
+    terminal_write(app, agent_id.to_string(), prompt.to_string())?;
+    std::thread::sleep(Duration::from_millis(600));
+    terminal_write(app, agent_id.to_string(), "\r".to_string())
+}
+
+/// Tira as sequências de terminal (CSI de cor/posição, OSC de título) e devolve texto em linhas
+/// curtas, sem repetição seguida. É o que sobra da tela de uma sessão, legível por humano e por log.
+fn strip_terminal_escapes(raw: &str) -> Vec<String> {
+    let mut clean = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            clean.push(character);
+            continue;
+        }
+        match chars.next() {
+            // CSI: `ESC [ … final` (o final está em @..~)
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            // OSC: `ESC ] … BEL` ou `ESC ] … ESC \`
+            Some(']') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for line in clean.split(['\r', '\n']) {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() || lines.last() == Some(&line) {
+            continue;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// Rastro do que a sessão de prova mostrou, para o registro explicar a reprovação sozinho: o
+/// scrollback da sessão morre junto com ela, e sem isto o motivo se perde (foi assim que a prova do
+/// claude ficou 244s "sem efeito" sem dizer que a TUI estava esperando resposta de um diálogo).
+fn proof_output_tail(app: &AppHandle, agent_id: &str) -> String {
+    let raw = terminal_scrollback(app, agent_id.to_string(), Some(16384)).unwrap_or_default();
+    let lines = strip_terminal_escapes(&raw);
+    let tail = lines
+        .iter()
+        .rev()
+        .take(12)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    tail.chars().take(2000).collect()
+}
+
+/// Espera a saída do terminal parar de crescer: o CLI subiu e está esperando input. Não é leitura de
+/// tela (nada de casar texto de TUI, que muda de versão para versão): é ausência de movimento.
+fn wait_for_output_to_settle(app: &AppHandle, agent_id: &str, limit: Duration, quiet: Duration) {
+    let started = Instant::now();
+    let mut last_len = 0usize;
+    let mut last_change = Instant::now();
+    while started.elapsed() < limit {
+        let len = terminal_scrollback(app, agent_id.to_string(), Some(4096))
+            .map(|output| output.len())
+            .unwrap_or(0);
+        if len != last_len {
+            last_len = len;
+            last_change = Instant::now();
+        } else if last_change.elapsed() >= quiet {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+}
+
+/// Espera o arquivo da prova existir com o conteúdo exato (trim). Devolve `false` no teto — quem
+/// chama registra a etapa como não medida, nunca como sucesso.
+fn wait_for_proof_file(file: &std::path::Path, expected: &str, limit: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if std::fs::read_to_string(file)
+            .map(|content| content.trim() == expected)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+fn runtime_route(
+    app: &AppHandle,
+    method: &str,
+    path: &str,
+    request: &mut Request,
+) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    let rest = path.strip_prefix("/control/v1/runtimes/")?;
+    let (id, action) = rest.split_once('/')?;
+    let id = id.trim();
+    if action != "proof" {
+        return Some(error_response(404, "control_route_not_found"));
+    }
+    if method != "POST" {
+        return Some(error_response(405, "method_not_allowed"));
+    }
+    let input = match read_json::<RuntimeProofInput>(request) {
+        Ok(input) => input,
+        Err(error) => return Some(error_response(400, &error)),
+    };
+    Some(runtime_proof_route(app, id, input))
+}
+
+fn agent_route(app: &AppHandle, method: &str, path: &str, url: &str, request: &mut Request) -> Option<Response<std::io::Cursor<Vec<u8>>>> {    if method == "POST" && path == "/control/v1/agents/spawn" {
         return Some(match read_json::<AgentSpawnInput>(request).and_then(|input| agent_spawn(app, input)) {
             Ok(payload) => json_response(201, payload),
             Err(error) if error.starts_with("agent_runtime_not_supported") => error_response(422, &error),
@@ -1661,7 +2015,9 @@ pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16
     let response = if path == "/control/v1/runtime" && method == "GET" {
         json_response(200, runtime(port))
     } else if path == "/control/v1/agents" && method == "GET" {
-        json_response(200, agents())
+        json_response(200, agents(&app))
+    } else if path.starts_with("/control/v1/runtimes/") {
+        runtime_route(&app, &method, path, &mut request).unwrap_or_else(|| error_response(404, "control_route_not_found"))
     } else if path.starts_with("/control/v1/agents/") {
         agent_route(&app, &method, path, url, &mut request).unwrap_or_else(|| error_response(404, "control_route_not_found"))
     } else if path.starts_with("/control/v1/fs/") || path == "/control/v1/fs" {
@@ -1696,8 +2052,18 @@ pub fn handle_request(app: AppHandle, mut request: Request, url: &str, port: u16
             Err(error) => error_response(500, &error),
         }
     } else if path == "/control/v1/terminals" && method == "POST" {
-        match read_json::<TerminalStartInput>(&mut request).and_then(|input| terminal_start(&app, input)) {
-            Ok(payload) => json_response(201, payload),
+        match read_json::<TerminalStartInput>(&mut request).and_then(|input| {
+            let runtime = input.command.clone().unwrap_or_default();
+            let cwd = input.cwd.clone();
+            terminal_start(&app, input).map(|payload| (payload, runtime, cwd))
+        }) {
+            Ok((payload, runtime, cwd)) => {
+                // O chamador externo pediu uma sessão: ela aparece na janela ligada a este pty id.
+                if let Some(id) = payload.get("id").and_then(|value| value.as_str()) {
+                    announce_pane_open(&app, id, &runtime, cwd.as_deref());
+                }
+                json_response(201, payload)
+            }
             Err(error) => error_response(400, &error),
         }
     } else if path == "/control/v1/terminals" && method == "GET" {
@@ -3037,5 +3403,77 @@ mod tests {
             !source.contains(retired_409),
             "o 409 do resume anunciado sem implementação não pode voltar"
         );
+    }
+
+    /// O anúncio de pane é o que faz a sessão do control plane aparecer na janela. O contrato do
+    /// payload é o que este teste fixa: o id do PTY (para o pane se ligar à sessão REAL, sem subir
+    /// um segundo processo), o runtime e o diretório — e nada além disso.
+    #[test]
+    fn the_pane_announcement_carries_the_live_session_id() {
+        let payload = pane_open_payload("agent-abc123", "codex", Some("C:\\proj"));
+        assert_eq!(payload["pty_id"], "agent-abc123");
+        assert_eq!(payload["runtime"], "codex");
+        assert_eq!(payload["cwd"], "C:\\proj");
+        assert_eq!(
+            payload.as_object().expect("objeto json").len(),
+            3,
+            "canal de UI: só o que abre o pane, sem tarefa nem texto"
+        );
+
+        // Sem cwd o payload continua completo: o renderer cai no projeto atual em vez de quebrar.
+        assert_eq!(pane_open_payload("x", "shell", None)["cwd"], "");
+
+        // As duas portas de spawn externo anunciam. Um spawn sem anúncio é exatamente o defeito
+        // que este canal corrige (o processo vivo no /terminals e nenhum pane na tela). Os
+        // literais vão quebrados de propósito: um literal inteiro casaria consigo mesmo aqui.
+        let source = include_str!("control.rs");
+        let spawn_call = concat!("announce_pane_open(app, &id, &agent, ", "cwd.as_deref());");
+        assert_eq!(
+            source.matches(spawn_call).count(),
+            1,
+            "agent_spawn anuncia a sessão que subiu"
+        );
+        let terminal_call = concat!("announce_pane_open(&app, id, &runtime, ", "cwd.as_deref());");
+        assert_eq!(
+            source.matches(terminal_call).count(),
+            1,
+            "POST /terminals anuncia a sessão que subiu"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proof_tail_tests {
+    use super::strip_terminal_escapes;
+
+    /// O rastro do registro tem que ser legível: a saída crua de uma TUI é feita de CSI/OSC, e sem
+    /// limpar sobra lixo que ninguém lê. O caso real é o do claude (título OSC + cores + repetição
+    /// de linha na repintura da TUI).
+    #[test]
+    fn the_proof_trace_drops_terminal_sequences_and_repeats() {
+        let raw = "\u{1b}]0;claude\u{7}\u{1b}[?9001h\u{1b}[2J\u{1b}[1;2HAccessing workspace:\r\n\
+                   \u{1b}[38;2;150;108;30mQuick safety check\u{1b}[m\r\n\
+                   Quick safety check\r\n\
+                   \u{1b}[?25l❯ 1. Yes, I trust this folder\u{1b}[?25h\r\n";
+
+        let lines = strip_terminal_escapes(raw);
+        assert_eq!(
+            lines,
+            vec![
+                "Accessing workspace:",
+                "Quick safety check",
+                "❯ 1. Yes, I trust this folder",
+            ],
+            "sem sequência de terminal, sem linha repetida na repintura"
+        );
+        assert!(!lines.iter().any(|line| line.contains('\u{1b}')), "sobrou ESC: {lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("9001h")), "sobrou CSI: {lines:?}");
+    }
+
+    /// OSC terminada por `ESC \` (ST) também sai inteira — é o que o Windows Terminal manda.
+    #[test]
+    fn the_proof_trace_handles_st_terminated_osc() {
+        let lines = strip_terminal_escapes("antes\u{1b}]0;titulo\u{1b}\\depois");
+        assert_eq!(lines, vec!["antesdepois"]);
     }
 }

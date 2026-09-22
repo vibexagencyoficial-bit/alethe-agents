@@ -1,9 +1,9 @@
 {
-  "generatedAt": "2026-09-21T20:31:18.100Z",
+  "generatedAt": "2026-09-21T23:46:37.346Z",
   "source": "src-tauri/src/control.rs (capabilities)",
   "counts": {
     "public": 5,
-    "authenticated": 57
+    "authenticated": 58
   },
   "publicEndpoints": [
     {
@@ -35,6 +35,10 @@
     {
       "method": "GET",
       "path": "/control/v1/agents"
+    },
+    {
+      "method": "POST",
+      "path": "/control/v1/runtimes/{id}/proof"
     },
     {
       "method": "POST",
