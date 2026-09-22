@@ -463,6 +463,23 @@ mod concurrency_tests {
         (status, elapsed)
     }
 
+    /// Espera a vaga voltar ao pool. O cliente lê o corpo da resposta assim que o servidor o
+    /// escreve, mas a thread do pedido só devolve a vaga no `Drop` do permit, depois do
+    /// `respond` retornar: ler `active()` no instante em que o cliente termina é uma corrida
+    /// contra o lado servidor, não uma prova de que a vaga ficou presa. A espera é limitada —
+    /// vaga que não volta dentro do prazo continua sendo falha.
+    fn wait_until_pool_drains(pool: &crate::request_pool::RequestPool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.active() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a vaga não voltou ao pool em 2s (presa no pedido): active={}",
+                pool.active()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// `Connection: close` de propósito: o servidor fecha no fim da resposta e a leitura vai
     /// até o fim do corpo sem depender de tempo.
     fn timed_get_raw(port: u16, path: &str) -> (u16, f64, String) {
@@ -648,7 +665,7 @@ mod concurrency_tests {
 
         let (slow_status, _) = slow_request.join().expect("pedido lento");
         assert_eq!(slow_status, 200, "quem estava na vaga termina normalmente");
-        assert_eq!(pool.active(), 0, "a vaga volta depois do pedido");
+        wait_until_pool_drains(&pool);
     }
 
     #[test]
